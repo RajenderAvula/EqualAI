@@ -181,7 +181,6 @@ class EqualForegroundService : Service(), TextToSpeech.OnInitListener {
 
                     override fun onError(error: Int) {
                         isListening = false
-                        // Automatically restart on silence, timeouts, or speech ends
                         restartListeningLoop()
                     }
 
@@ -247,7 +246,6 @@ class EqualForegroundService : Service(), TextToSpeech.OnInitListener {
 
     fun speakBackground(text: String) {
         if (isTtsReady) {
-            // Temporarily pause listening while speaking so it does not hear its own voice
             speechRecognizer?.stopListening()
             isListening = false
             tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "BG_SPEECH")
@@ -407,7 +405,9 @@ suspend fun parseCommandUnified(
                     "SEND_SMS" -> ActionExecutor.sendSms(context, target, message)
                     "DISMISS_NOTIFICATION" -> AssistantBridge.notificationService?.dismissLatest()
                     "REPLY_NOTIFICATION" -> AssistantBridge.notificationService?.replyToLatest(message)
+                    else -> {}
                 }
+                Unit
             }
         } catch (e: Exception) {
             AssistantBridge.log("Online parse err: ${e.localizedMessage}")
@@ -630,14 +630,12 @@ object ActionExecutor {
         }
 
         if (targetPkg != null) {
-            // First try launching via Accessibility Service (bypasses Android 10+ background restriction)
             val launchedViaA11y = AssistantBridge.accessibilityService?.launchAppFromAccessibility(targetPkg) ?: false
             if (launchedViaA11y) {
                 AssistantBridge.log("Opened $targetPkg via Accessibility")
                 return true
             }
 
-            // Fallback via normal launcher intent
             val pm = context.packageManager
             val launchIntent = pm.getLaunchIntentForPackage(targetPkg)
             if (launchIntent != null) {
@@ -793,6 +791,7 @@ class ScheduledTaskReceiver : BroadcastReceiver() {
                     AssistantBridge.foregroundService?.speakBackground(message)
                 }, 8000)
             }
+            else -> {}
         }
     }
 }
@@ -817,7 +816,6 @@ class MainActivity : ComponentActivity() {
                 val launcher = rememberLauncherForActivityResult(
                     ActivityResultContracts.RequestMultiplePermissions()
                 ) {
-                    // Start Background Service only after permissions are granted
                     startAssistantService()
                 }
 
