@@ -109,7 +109,7 @@ object AssistantBridge {
 }
 
 // ============================================================================
-// 2. NOTIFICATION LISTENER SERVICE (Reads Aloud + Inline Replies + Dismiss)
+// 2. NOTIFICATION LISTENER SERVICE
 // ============================================================================
 
 class EqualNotificationService : NotificationListenerService() {
@@ -203,7 +203,7 @@ class EqualNotificationService : NotificationListenerService() {
 }
 
 // ============================================================================
-// 3. ACCESSIBILITY SERVICE (Auto-Login Credentials + WhatsApp Auto-Send)
+// 3. ACCESSIBILITY SERVICE (Auto-Login + WhatsApp Auto-Send)
 // ============================================================================
 
 class EqualAccessibilityService : AccessibilityService() {
@@ -219,7 +219,7 @@ class EqualAccessibilityService : AccessibilityService() {
                 if (node.isClickable && node.ContentDescriptionOrText().contains("Send", ignoreCase = true)) {
                     node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
                     AssistantBridge.autoClickSendUntil = 0L
-                    AssistantBridge.log("Auto-clicked Send button.")
+                    AssistantBridge.log("Auto-clicked WhatsApp Send button.")
                     break
                 }
             }
@@ -352,7 +352,7 @@ class EqualCallScreeningService : CallScreeningService() {
 }
 
 // ============================================================================
-// 6. ACTION EXECUTOR & GEMINI AI COMMAND ROUTER
+// 6. ACTION EXECUTOR & COMMAND ROUTER
 // ============================================================================
 
 object ActionExecutor {
@@ -417,11 +417,33 @@ object ActionExecutor {
     }
 
     fun sendWhatsApp(context: Context, target: String, message: String) {
+        if (target.isBlank() && message.isBlank()) {
+            openAppByName(context, "whatsapp")
+            return
+        }
         if (target.isBlank() && AssistantBridge.notificationService?.replyToLatest(message) == true) {
             return
         }
         var number = resolveContactNumber(context, target).filter { it.isDigit() }
         if (number.length == 10) number = "91$number"
+
+        if (number.isBlank()) {
+            // If no phone number resolved, open WhatsApp directly with share text
+            try {
+                val intent = Intent(Intent.ACTION_SEND).apply {
+                    type = "text/plain"
+                    setPackage("com.whatsapp")
+                    putExtra(Intent.EXTRA_TEXT, message)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                context.startActivity(intent)
+                AssistantBridge.log("Opened WhatsApp with message: $message")
+                return
+            } catch (e: Exception) {
+                openAppByName(context, "whatsapp")
+                return
+            }
+        }
 
         try {
             AssistantBridge.autoClickSendUntil = System.currentTimeMillis() + 7000L
@@ -432,9 +454,9 @@ object ActionExecutor {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
             context.startActivity(intent)
-            AssistantBridge.log("Opening WhatsApp for $number")
+            AssistantBridge.log("Opening WhatsApp chat for $number")
         } catch (e: Exception) {
-            AssistantBridge.log("WhatsApp error: ${e.localizedMessage}")
+            openAppByName(context, "whatsapp")
         }
     }
 
@@ -455,24 +477,61 @@ object ActionExecutor {
 
     fun openAppByName(context: Context, spokenAppName: String): Boolean {
         val pm = context.packageManager
-        val cleanName = spokenAppName.trim().lowercase()
-        val packages = pm.getInstalledApplications(0)
+        val cleanName = spokenAppName
+            .lowercase()
+            .replace("open ", "")
+            .replace("launch ", "")
+            .replace("start ", "")
+            .replace("app", "")
+            .trim()
 
-        val matchedApp = packages.firstOrNull { appInfo ->
-            val label = pm.getApplicationLabel(appInfo).toString().lowercase()
-            label == cleanName || label.contains(cleanName) || appInfo.packageName.lowercase().contains(cleanName)
-        }
+        // 1. Direct fast-path for popular apps
+        val directPackages = mapOf(
+            "whatsapp" to listOf("com.whatsapp", "com.whatsapp.w4b"),
+            "youtube" to listOf("com.google.android.youtube"),
+            "chrome" to listOf("com.android.chrome"),
+            "instagram" to listOf("com.instagram.android"),
+            "gmail" to listOf("com.google.android.gm"),
+            "maps" to listOf("com.google.android.apps.maps"),
+            "telegram" to listOf("org.telegram.messenger"),
+            "phone" to listOf("com.google.android.dialer", "com.samsung.android.dialer")
+        )
 
-        if (matchedApp != null) {
-            val launchIntent = pm.getLaunchIntentForPackage(matchedApp.packageName)
-            if (launchIntent != null) {
-                launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                context.startActivity(launchIntent)
-                AssistantBridge.log("Opened app: ${pm.getApplicationLabel(matchedApp)}")
-                return true
+        for ((keyword, pkgList) in directPackages) {
+            if (cleanName.contains(keyword)) {
+                for (pkg in pkgList) {
+                    val launchIntent = pm.getLaunchIntentForPackage(pkg)
+                    if (launchIntent != null) {
+                        launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        context.startActivity(launchIntent)
+                        AssistantBridge.log("Opened $keyword ($pkg)")
+                        return true
+                    }
+                }
             }
         }
-        AssistantBridge.log("Could not find installed app matching '$spokenAppName'")
+
+        // 2. Query all launchable apps on the phone
+        val mainIntent = Intent(Intent.ACTION_MAIN, null).apply {
+            addCategory(Intent.CATEGORY_LAUNCHER)
+        }
+        val launchables = pm.queryIntentActivities(mainIntent, 0)
+
+        for (resolveInfo in launchables) {
+            val label = resolveInfo.loadLabel(pm).toString().lowercase()
+            val pkgName = resolveInfo.activityInfo.packageName.lowercase()
+            if (label == cleanName || label.contains(cleanName) || cleanName.contains(label) || pkgName.contains(cleanName)) {
+                val launchIntent = pm.getLaunchIntentForPackage(resolveInfo.activityInfo.packageName)
+                if (launchIntent != null) {
+                    launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    context.startActivity(launchIntent)
+                    AssistantBridge.log("Opened app: ${resolveInfo.loadLabel(pm)}")
+                    return true
+                }
+            }
+        }
+
+        AssistantBridge.log("Could not find installed app matching '$cleanName'")
         return false
     }
 
@@ -572,10 +631,47 @@ suspend fun processVoiceCommandWithGemini(
     savedUser: String,
     savedPass: String
 ) {
-    AssistantBridge.log("Heard: \"$spokenCommand\"")
+    val cmdTrimmed = spokenCommand.trim()
+    val lower = cmdTrimmed.lowercase()
+    AssistantBridge.log("Heard: \"$cmdTrimmed\"")
+
+    // =========================================================================
+    // STEP 1: INSTANT ON-DEVICE ROUTER (Works with zero lag & without API key)
+    // =========================================================================
+    if (lower.startsWith("open ") || lower.startsWith("launch ")) {
+        val appTarget = lower.removePrefix("open ").removePrefix("launch ").trim()
+        val opened = ActionExecutor.openAppByName(context, appTarget)
+        if (opened) {
+            AssistantBridge.speakAndPromptCallback?.invoke("Opening $appTarget", false)
+            return
+        }
+    }
+
+    if (lower == "whatsapp" || lower == "open whatsapp") {
+        ActionExecutor.openAppByName(context, "whatsapp")
+        AssistantBridge.speakAndPromptCallback?.invoke("Opening WhatsApp", false)
+        return
+    }
+
+    if (lower == "close" || lower == "close it" || lower == "dismiss" || lower == "ignore") {
+        AssistantBridge.notificationService?.dismissLatest()
+        AssistantBridge.speakAndPromptCallback?.invoke("Notification dismissed.", false)
+        return
+    }
+
+    if (lower.startsWith("call ") && !lower.contains(" at ") && !lower.contains(" in ")) {
+        val target = cmdTrimmed.substring(5).trim()
+        AssistantBridge.speakAndPromptCallback?.invoke("Calling $target", false)
+        ActionExecutor.makePhoneCall(context, target)
+        return
+    }
+
+    // =========================================================================
+    // STEP 2: AI PARSER FOR COMPLEX, CONTEXTUAL, OR SCHEDULED COMMANDS
+    // =========================================================================
     if (apiKey.isBlank()) {
         AssistantBridge.speakAndPromptCallback?.invoke(
-            "Please paste your Google AI Studio API Key in the Settings tab first.",
+            "Please paste your Google AI Studio API Key in the Setup tab for complex AI commands.",
             false
         )
         return
@@ -592,24 +688,19 @@ suspend fun processVoiceCommandWithGemini(
         You are an Android system voice assistant. Parse the user's voice command into a single JSON object.
         Current Context: $notifContext
         Saved default login username: "$savedUser", password: "$savedPass"
-        User said: "$spokenCommand"
+        User said: "$cmdTrimmed"
 
         Return ONLY raw valid JSON (no markdown backticks) with these exact keys:
         {
           "action": "DISMISS_NOTIFICATION" | "REPLY_NOTIFICATION" | "SEND_SMS" | "MAKE_CALL" | "SEND_WHATSAPP" | "OPEN_APP" | "AUTO_LOGIN" | "SEND_EMAIL" | "SCHEDULE_TASK" | "SPEAK_ONLY",
           "spoken_confirm": "Short sentence confirming what you are doing",
-          "target": "phone number, contact name, email address, app name to open, or username for login",
+          "target": "phone number, contact name, email address, app name to open (e.g. WhatsApp), or username for login",
           "secondary_target": "password for login, email subject, or scheduled sub-action (CALL_SPEAK, WHATSAPP, SMS)",
           "message": "message text to send or speak",
           "delay_minutes": 0,
           "scheduled_hour": -1,
           "scheduled_minute": -1
         }
-        Rules:
-        - If user says "close", "dismiss", or "ignore", use DISMISS_NOTIFICATION.
-        - If user says "reply [text]" to the notification, use REPLY_NOTIFICATION.
-        - If user asks to schedule talking/calling or messaging at a time (e.g. "at 5:30 PM" or "in 10 minutes"), use SCHEDULE_TASK and set secondary_target to "CALL_SPEAK", "WHATSAPP", or "SMS", and set scheduled_hour (0-23) & scheduled_minute (0-59) or delay_minutes.
-        - If user asks to login, use AUTO_LOGIN, put username in target and password in secondary_target (use saved defaults if user didn't speak new ones).
     """.trimIndent()
 
     val rawResponse = withContext(Dispatchers.IO) {
@@ -620,7 +711,15 @@ suspend fun processVoiceCommandWithGemini(
         }
     }
 
-    val cleanedJson = rawResponse.replace("```json", "").replace("```", "").trim()
+    // Extract JSON block safely even if Gemini adds extra text around it
+    val startIdx = rawResponse.indexOf('{')
+    val endIdx = rawResponse.lastIndexOf('}')
+    val cleanedJson = if (startIdx >= 0 && endIdx > startIdx) {
+        rawResponse.substring(startIdx, endIdx + 1)
+    } else {
+        rawResponse.replace("```json", "").replace("```", "").trim()
+    }
+
     try {
         val obj = JSONObject(cleanedJson)
         val action = obj.optString("action", "SPEAK_ONLY")
@@ -655,7 +754,7 @@ suspend fun processVoiceCommandWithGemini(
                     ActionExecutor.sendWhatsApp(context, target, message)
                 }
                 "OPEN_APP" -> {
-                    ActionExecutor.openAppByName(context, target)
+                    ActionExecutor.openAppByName(context, target.ifBlank { cmdTrimmed })
                 }
                 "AUTO_LOGIN" -> {
                     AssistantBridge.pendingLoginUser = target.ifBlank { savedUser }
@@ -674,6 +773,7 @@ suspend fun processVoiceCommandWithGemini(
             Unit
         }
     } catch (e: Exception) {
+        AssistantBridge.log("Parse error: ${e.localizedMessage}")
         AssistantBridge.speakAndPromptCallback?.invoke(rawResponse.take(160), false)
     }
 }
