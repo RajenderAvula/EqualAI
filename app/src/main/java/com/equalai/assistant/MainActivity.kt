@@ -32,7 +32,6 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -81,7 +80,7 @@ data class AppNotificationItem(
 
 data class ScheduledActionItem(
     val id: Int = (System.currentTimeMillis() % Int.MAX_VALUE).toInt(),
-    val actionType: String, // "CALL_SPEAK", "WHATSAPP", "SMS"
+    val actionType: String,
     val target: String,
     val message: String,
     val timeLabel: String
@@ -95,15 +94,12 @@ object AssistantBridge {
     var readNotificationsAloud by mutableStateOf(true)
     var latestNotification: AppNotificationItem? = null
 
-    // Callbacks registered by MainActivity for TTS + Voice loop
     var speakAndPromptCallback: ((String, Boolean) -> Unit)? = null
 
-    // Pending Accessibility tasks
     var pendingLoginUser: String? = null
     var pendingLoginPass: String? = null
     var autoClickSendUntil: Long = 0L
 
-    // Reference to active NotificationListenerService
     var notificationService: EqualNotificationService? = null
 
     fun log(msg: String) {
@@ -141,7 +137,6 @@ class EqualNotificationService : NotificationListenerService() {
         val text = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString() ?: ""
         if (title.isBlank() && text.isBlank()) return
 
-        // Avoid repeating identical consecutive notifications
         val latest = AssistantBridge.latestNotification
         if (latest != null && latest.sender == title && latest.message == text) return
 
@@ -152,7 +147,6 @@ class EqualNotificationService : NotificationListenerService() {
             pkg.substringAfterLast('.')
         }
 
-        // Find inline reply action (WhatsApp, Messages, Telegram, Instagram, etc.)
         val replyAction = sbn.notification?.actions?.firstOrNull { action ->
             action.remoteInputs?.isNotEmpty() == true
         }
@@ -217,7 +211,6 @@ class EqualAccessibilityService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val root = rootInActiveWindow ?: return
 
-        // A. Handle Auto-Click "Send" in WhatsApp when triggered by voice/scheduler
         if (System.currentTimeMillis() < AssistantBridge.autoClickSendUntil) {
             val sendNodes = root.findAccessibilityNodeInfosByViewId("com.whatsapp:id/send")
                 .ifEmpty { root.findAccessibilityNodeInfosByText("Send") }
@@ -232,7 +225,6 @@ class EqualAccessibilityService : AccessibilityService() {
             }
         }
 
-        // B. Handle Auto-Login when credentials are provided by voice
         val user = AssistantBridge.pendingLoginUser
         val pass = AssistantBridge.pendingLoginPass
         if (!user.isNullOrBlank() || !pass.isNullOrBlank()) {
@@ -278,7 +270,6 @@ class EqualAccessibilityService : AccessibilityService() {
             AssistantBridge.pendingLoginPass = null
             AssistantBridge.log("Filled login credentials on screen.")
 
-            // Click Login / Sign In / Submit button if visible
             val loginBtn = clickableNodes.firstOrNull { node ->
                 val label = node.ContentDescriptionOrText().lowercase()
                 label.contains("log in") || label.contains("login") ||
@@ -314,7 +305,7 @@ class EqualAccessibilityService : AccessibilityService() {
 }
 
 // ============================================================================
-// 4. SCHEDULED TASK RECEIVER (Executes Calls, TTS Speech, WhatsApp, or SMS on Timer)
+// 4. SCHEDULED TASK RECEIVER
 // ============================================================================
 
 class ScheduledTaskReceiver : BroadcastReceiver() {
@@ -330,12 +321,12 @@ class ScheduledTaskReceiver : BroadcastReceiver() {
             "WHATSAPP" -> ActionExecutor.sendWhatsApp(context, target, message)
             "CALL_SPEAK" -> {
                 ActionExecutor.makePhoneCall(context, target)
-                // Wait 8 seconds for call pickup, then speak message aloud
                 CoroutineScope(Dispatchers.Main).launch {
                     delay(8000)
                     AssistantBridge.speakAndPromptCallback?.invoke(message, false)
                 }
             }
+            else -> {}
         }
     }
 }
@@ -426,12 +417,11 @@ object ActionExecutor {
     }
 
     fun sendWhatsApp(context: Context, target: String, message: String) {
-        // If target is empty and we have an active WhatsApp notification, reply inline first
         if (target.isBlank() && AssistantBridge.notificationService?.replyToLatest(message) == true) {
             return
         }
         var number = resolveContactNumber(context, target).filter { it.isDigit() }
-        if (number.length == 10) number = "91$number" // Default India prefix if 10 digits
+        if (number.length == 10) number = "91$number"
 
         try {
             AssistantBridge.autoClickSendUntil = System.currentTimeMillis() + 7000L
@@ -646,28 +636,42 @@ suspend fun processVoiceCommandWithGemini(
 
         withContext(Dispatchers.Main) {
             when (action) {
-                "DISMISS_NOTIFICATION" -> AssistantBridge.notificationService?.dismissLatest()
+                "DISMISS_NOTIFICATION" -> {
+                    AssistantBridge.notificationService?.dismissLatest()
+                }
                 "REPLY_NOTIFICATION" -> {
                     val ok = AssistantBridge.notificationService?.replyToLatest(message) ?: false
                     if (!ok && latestNotif != null) {
                         ActionExecutor.sendSms(context, latestNotif.sender, message)
                     }
                 }
-                "SEND_SMS" -> ActionExecutor.sendSms(context, target.ifBlank { latestNotif?.sender ?: "" }, message)
-                "MAKE_CALL" -> ActionExecutor.makePhoneCall(context, target.ifBlank { latestNotif?.sender ?: "" })
-                "SEND_WHATSAPP" -> ActionExecutor.sendWhatsApp(context, target, message)
-                "OPEN_APP" -> ActionExecutor.openAppByName(context, target)
+                "SEND_SMS" -> {
+                    ActionExecutor.sendSms(context, target.ifBlank { latestNotif?.sender ?: "" }, message)
+                }
+                "MAKE_CALL" -> {
+                    ActionExecutor.makePhoneCall(context, target.ifBlank { latestNotif?.sender ?: "" })
+                }
+                "SEND_WHATSAPP" -> {
+                    ActionExecutor.sendWhatsApp(context, target, message)
+                }
+                "OPEN_APP" -> {
+                    ActionExecutor.openAppByName(context, target)
+                }
                 "AUTO_LOGIN" -> {
                     AssistantBridge.pendingLoginUser = target.ifBlank { savedUser }
                     AssistantBridge.pendingLoginPass = secondary.ifBlank { savedPass }
                     AssistantBridge.log("Armed Auto-Login for user: ${AssistantBridge.pendingLoginUser}")
                 }
-                "SEND_EMAIL" -> ActionExecutor.sendEmail(context, target, secondary.ifBlank { "Message from Equal AI" }, message)
+                "SEND_EMAIL" -> {
+                    ActionExecutor.sendEmail(context, target, secondary.ifBlank { "Message from Equal AI" }, message)
+                }
                 "SCHEDULE_TASK" -> {
                     val subType = if (secondary in listOf("CALL_SPEAK", "WHATSAPP", "SMS")) secondary else "CALL_SPEAK"
                     ActionExecutor.scheduleTask(context, subType, target, message, delayMin, hour, minute)
                 }
+                else -> {}
             }
+            Unit
         }
     } catch (e: Exception) {
         AssistantBridge.speakAndPromptCallback?.invoke(rawResponse.take(160), false)
@@ -688,8 +692,6 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         super.onCreate(savedInstanceState)
         tts = TextToSpeech(this, this)
         speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
-
-        val prefs = getSharedPreferences("equal_prefs", Context.MODE_PRIVATE)
 
         AssistantBridge.speakAndPromptCallback = { text, listenAfter ->
             speakText(text, listenAfter)
@@ -881,7 +883,6 @@ fun EqualAssistantMainScreen(
                 .background(Color(0xFFF8FAFC))
                 .padding(16.dp)
         ) {
-            // Universal Command Bar (Voice or Text)
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
@@ -925,7 +926,7 @@ fun EqualAssistantMainScreen(
             when (selectedTab) {
                 0 -> NotificationsAndLogsTab(onTestSpeakAndListen = onTestSpeakAndListen)
                 1 -> SchedulerTab(context = context)
-                2 -> SetupAndVaultTab(
+                else -> SetupAndVaultTab(
                     context = context,
                     apiKey = apiKey,
                     onApiKeyChange = {
@@ -992,7 +993,7 @@ fun NotificationsAndLogsTab(onTestSpeakAndListen: () -> Unit) {
             if (AssistantBridge.notifications.isEmpty()) {
                 item {
                     Text(
-                        "No notifications yet. Enable Notification Access in the Setup tab, or tap 'Test Voice Prompt' below.",
+                        "No notifications yet. Enable Notification Access in the Setup tab.",
                         color = Color.Gray,
                         fontSize = 13.sp
                     )
@@ -1050,7 +1051,7 @@ fun SchedulerTab(context: Context) {
     ) {
         Text("Schedule Voice Call, WhatsApp, or SMS", fontWeight = FontWeight.Bold, fontSize = 17.sp)
         Text(
-            "You can schedule by voice (e.g. 'At 6:30 PM WhatsApp Rahul saying I am ready') or add manually below:",
+            "Schedule by voice (e.g. 'At 6:30 PM WhatsApp Rahul saying I am ready') or add manually below:",
             fontSize = 13.sp,
             color = Color.Gray
         )
