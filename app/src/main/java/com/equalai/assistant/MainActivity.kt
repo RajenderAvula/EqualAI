@@ -122,7 +122,7 @@ object AssistantBridge {
 }
 
 // ============================================================================
-// 2. FOREGROUND SERVICE (Continuous Background & TTS-to-Speech Loop)
+// 2. FOREGROUND SERVICE (Robust Continuous Speech Loop & Fallbacks)
 // ============================================================================
 
 class EqualForegroundService : Service(), TextToSpeech.OnInitListener {
@@ -132,6 +132,7 @@ class EqualForegroundService : Service(), TextToSpeech.OnInitListener {
     private var speechRecognizer: SpeechRecognizer? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private var isListening = false
+    private var preferOfflineFlag = true
 
     override fun onCreate() {
         super.onCreate()
@@ -140,7 +141,7 @@ class EqualForegroundService : Service(), TextToSpeech.OnInitListener {
         try {
             tts = TextToSpeech(this, this)
         } catch (e: Exception) {
-            AssistantBridge.log("TTS err: ${e.localizedMessage}")
+            AssistantBridge.log("TTS init error: ${e.localizedMessage}")
         }
 
         createNotificationChannel()
@@ -149,21 +150,24 @@ class EqualForegroundService : Service(), TextToSpeech.OnInitListener {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                 startForeground(
                     1001,
-                    buildNotification("Equal AI Listening Always"),
+                    buildNotification("Equal AI Background Voice Active"),
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
                 )
             } else {
-                startForeground(1001, buildNotification("Equal AI Listening Always"))
+                startForeground(1001, buildNotification("Equal AI Background Voice Active"))
             }
         } catch (e: Exception) {
-            AssistantBridge.log("FGS err: ${e.localizedMessage}")
+            AssistantBridge.log("FGS start fallback: ${e.localizedMessage}")
         }
 
         mainHandler.postDelayed({ initSpeechRecognizer() }, 1500)
     }
 
     private fun initSpeechRecognizer() {
-        if (!SpeechRecognizer.isRecognitionAvailable(this)) return
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            AssistantBridge.log("Speech recognition unavailable on this device")
+            return
+        }
 
         try {
             speechRecognizer?.destroy()
@@ -173,27 +177,45 @@ class EqualForegroundService : Service(), TextToSpeech.OnInitListener {
                         isListening = false
                         val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                         if (!matches.isNullOrEmpty()) {
-                            AssistantBridge.promptInTextBoxCallback?.invoke(matches[0])
-                            handleSpokenCommand(matches[0])
+                            val recognized = matches[0]
+                            AssistantBridge.promptInTextBoxCallback?.invoke(recognized)
+                            handleSpokenCommand(recognized)
                         } else {
                             AssistantBridge.promptInTextBoxCallback?.invoke("")
                         }
-                        restartListeningLoop(1000)
+                        restartListeningLoop(800)
                     }
+
                     override fun onPartialResults(partialResults: Bundle?) {
                         val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                         if (!matches.isNullOrEmpty()) {
                             AssistantBridge.promptInTextBoxCallback?.invoke("Hearing: ${matches[0]}...")
                         }
                     }
+
                     override fun onError(error: Int) {
                         isListening = false
-                        if (error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
-                            AssistantBridge.promptInTextBoxCallback?.invoke("")
+                        val errorMsg = when (error) {
+                            SpeechRecognizer.ERROR_AUDIO -> "Audio recording error"
+                            SpeechRecognizer.ERROR_CLIENT -> {
+                                preferOfflineFlag = false
+                                "Client error (switched to online mode)"
+                            }
+                            SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Mic permission missing"
+                            SpeechRecognizer.ERROR_NETWORK -> "Network required"
+                            SpeechRecognizer.ERROR_NO_MATCH -> "No speech detected"
+                            SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "Silence timeout"
+                            else -> "Speech code: $error"
                         }
-                        restartListeningLoop(1000)
+                        if (error != SpeechRecognizer.ERROR_NO_MATCH && error != SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
+                            AssistantBridge.log(errorMsg)
+                        }
+                        restartListeningLoop(1200)
                     }
-                    override fun onReadyForSpeech(params: Bundle?) { isListening = true }
+
+                    override fun onReadyForSpeech(params: Bundle?) {
+                        isListening = true
+                    }
                     override fun onBeginningOfSpeech() {}
                     override fun onRmsChanged(rmsdB: Float) {}
                     override fun onBufferReceived(buffer: ByteArray?) {}
@@ -203,14 +225,14 @@ class EqualForegroundService : Service(), TextToSpeech.OnInitListener {
             }
             startListeningInternal(false)
         } catch (e: Exception) {
-            AssistantBridge.log("Recognizer err: ${e.localizedMessage}")
+            AssistantBridge.log("Recognizer init error: ${e.localizedMessage}")
         }
     }
 
-    fun startListeningInternal(playBeep: Boolean) {
+    fun startListeningInternal(playPromptBeep: Boolean) {
         if (!AssistantBridge.isContinuousListeningEnabled || isListening) return
 
-        if (playBeep) {
+        if (playPromptBeep) {
             try {
                 val tone = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 100)
                 tone.startTone(ToneGenerator.TONE_PROP_PROMPT, 150)
@@ -221,8 +243,10 @@ class EqualForegroundService : Service(), TextToSpeech.OnInitListener {
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-IN")
-            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            if (preferOfflineFlag) {
+                putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+            }
         }
 
         mainHandler.post {
@@ -231,7 +255,7 @@ class EqualForegroundService : Service(), TextToSpeech.OnInitListener {
                 isListening = true
             } catch (e: Exception) {
                 isListening = false
-                restartListeningLoop(1000)
+                restartListeningLoop(1500)
             }
         }
     }
@@ -305,7 +329,7 @@ class EqualForegroundService : Service(), TextToSpeech.OnInitListener {
             PendingIntent.FLAG_IMMUTABLE
         )
         return NotificationCompat.Builder(this, "equal_bg_channel")
-            .setContentTitle("Equal AI")
+            .setContentTitle("Equal AI Assistant")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.sym_def_app_icon)
             .setContentIntent(pendingIntent)
@@ -323,7 +347,7 @@ class EqualForegroundService : Service(), TextToSpeech.OnInitListener {
 }
 
 // ============================================================================
-// 3. UNIFIED COMMAND PARSER (OFFLINE + CLOUD + CONTEXT AWARE)
+// 3. UNIFIED COMMAND PARSER (OFFLINE + CLOUD + CONTEXT-AWARE)
 // ============================================================================
 
 suspend fun parseCommandUnified(
@@ -343,7 +367,7 @@ suspend fun parseCommandUnified(
             AssistantBridge.foregroundService?.speakBackground("Opening ${AssistantBridge.latestNotification?.appName}")
             ActionExecutor.openAppByPackageName(context, targetPkg)
         } else {
-            AssistantBridge.foregroundService?.speakBackground("I don't know which app you mean.")
+            AssistantBridge.foregroundService?.speakBackground("No recent notification app to open.")
         }
         return
     }
@@ -378,21 +402,19 @@ suspend fun parseCommandUnified(
 
     if (clean.startsWith("text ") || clean.startsWith("reply ")) {
         val body = clean.substringAfter("saying", clean.removePrefix("text ").removePrefix("reply ")).trim().ifBlank { "Hello" }
-        // If there's an active notification, reply to it first
         if (AssistantBridge.notificationService?.replyToLatest(body) == true) {
             AssistantBridge.foregroundService?.speakBackground("Reply sent.")
             return
         }
     }
 
-    // Online Cloud Gemini Routing
+    // Online Gemini Routing
     if (apiKey.isBlank()) {
-        AssistantBridge.foregroundService?.speakBackground("Saved command. Please set API key for complex tasks.")
+        AssistantBridge.foregroundService?.speakBackground("Command noted.")
         return
     }
 
-    val notifContext = AssistantBridge.latestNotification?.let { "Latest Notification from ${it.appName}: ${it.message}" } ?: "No active notification"
-
+    val notifContext = AssistantBridge.latestNotification?.let { "Notification from ${it.appName}: ${it.message}" } ?: "No active alert"
     val prompt = """
         Context: $notifContext
         User said: "$spoken"
@@ -449,7 +471,7 @@ suspend fun parseCommandUnified(
                 Unit
             }
         } catch (e: Exception) {
-            AssistantBridge.log("Gemini parse err: ${e.localizedMessage}")
+            AssistantBridge.log("Gemini parse error: ${e.localizedMessage}")
         }
     }
 }
@@ -501,7 +523,6 @@ class EqualNotificationService : NotificationListenerService() {
             AssistantBridge.notifications.add(0, item)
 
             if (AssistantBridge.readNotificationsAloud) {
-                // Read the notification aloud, and then trigger the microphone beep immediately
                 val promptText = "Notification from $appName. ${item.sender} says: ${item.message}. What would you like to do next?"
                 AssistantBridge.promptInTextBoxCallback?.invoke("From $appName: ${item.message} -> What next?")
                 AssistantBridge.foregroundService?.speakBackground(promptText, listenAfter = true)
@@ -549,7 +570,7 @@ class EqualCallScreeningService : CallScreeningService() {
         val phoneNumber = callDetails.handle?.schemeSpecificPart ?: "Unknown"
         val callerName = ActionExecutor.resolveCallerName(this, phoneNumber)
 
-        AssistantBridge.log("Call from: $callerName ($phoneNumber)")
+        AssistantBridge.log("Incoming call: $callerName ($phoneNumber)")
 
         val speech = "You have an incoming call from $callerName."
         AssistantBridge.foregroundService?.speakBackground(speech, listenAfter = false)
@@ -583,7 +604,7 @@ class EqualCallScreeningService : CallScreeningService() {
                 }
             }
         } catch (e: Exception) {
-            AssistantBridge.log("Call auto-answer err: ${e.localizedMessage}")
+            AssistantBridge.log("Call auto-answer error: ${e.localizedMessage}")
         }
     }
 }
@@ -639,9 +660,7 @@ object ActionExecutor {
 
         if (targetPkg != null) {
             val launchedViaA11y = AssistantBridge.accessibilityService?.launchAppFromAccessibility(targetPkg) ?: false
-            if (launchedViaA11y) {
-                return true
-            }
+            if (launchedViaA11y) return true
 
             openAppByPackageName(context, targetPkg)
             return true
@@ -728,19 +747,74 @@ object ActionExecutor {
             clean
         }
     }
+
+    fun scheduleTask(
+        context: Context,
+        actionType: String,
+        target: String,
+        message: String,
+        triggerTimeMillis: Long,
+        attachmentUri: String? = null
+    ) {
+        val item = ScheduledActionItem(
+            actionType = actionType,
+            target = target,
+            message = message,
+            timeLabel = SimpleDateFormat("dd MMM, hh:mm a", Locale.getDefault()).format(Date(triggerTimeMillis)),
+            attachmentUri = attachmentUri
+        )
+        AssistantBridge.scheduledTasks.add(0, item)
+
+        val intent = Intent(context, ScheduledTaskReceiver::class.java).apply {
+            putExtra("actionType", actionType)
+            putExtra("target", target)
+            putExtra("message", message)
+            putExtra("attachmentUri", attachmentUri)
+        }
+        val pi = PendingIntent.getBroadcast(
+            context,
+            item.id,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        try {
+            am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerTimeMillis, pi)
+        } catch (e: Exception) {
+            am.set(AlarmManager.RTC_WAKEUP, triggerTimeMillis, pi)
+        }
+        AssistantBridge.log("Task scheduled for ${item.timeLabel}")
+    }
 }
 
 // ============================================================================
-// 7. ACCESSIBILITY & SCHEDULER
+// 7. ACCESSIBILITY SERVICE & SCHEDULED RECEIVER
 // ============================================================================
 
 class EqualAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         AssistantBridge.accessibilityService = this
+        AssistantBridge.log("Accessibility Service connected")
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        val root = rootInActiveWindow ?: return
+
+        if (System.currentTimeMillis() < AssistantBridge.autoClickSendUntil) {
+            val sendNodes = root.findAccessibilityNodeInfosByViewId("com.whatsapp:id/send")
+                .ifEmpty { root.findAccessibilityNodeInfosByText("Send") }
+
+            for (node in sendNodes) {
+                if (node.isClickable) {
+                    node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                    AssistantBridge.autoClickSendUntil = 0L
+                    AssistantBridge.log("Auto-clicked WhatsApp Send")
+                    break
+                }
+            }
+        }
+    }
 
     fun launchAppFromAccessibility(packageName: String): Boolean {
         val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
@@ -756,11 +830,28 @@ class EqualAccessibilityService : AccessibilityService() {
 }
 
 class ScheduledTaskReceiver : BroadcastReceiver() {
-    override fun onReceive(context: Context, intent: Intent) {}
+    override fun onReceive(context: Context, intent: Intent) {
+        val type = intent.getStringExtra("actionType") ?: return
+        val target = intent.getStringExtra("target") ?: ""
+        val message = intent.getStringExtra("message") ?: ""
+        val attachment = intent.getStringExtra("attachmentUri")
+
+        when (type) {
+            "SMS" -> ActionExecutor.sendSms(context, target, message)
+            "WHATSAPP" -> ActionExecutor.sendWhatsApp(context, target, message, attachment)
+            "CALL_SPEAK" -> {
+                ActionExecutor.makePhoneCall(context, target)
+                Handler(Looper.getMainLooper()).postDelayed({
+                    AssistantBridge.foregroundService?.speakBackground(message)
+                }, 8000)
+            }
+            else -> {}
+        }
+    }
 }
 
 // ============================================================================
-// 8. COMPOSE UI & ACTIVITY
+// 8. MAIN ACTIVITY & UI SCAFFOLD
 // ============================================================================
 
 class MainActivity : ComponentActivity() {
@@ -831,7 +922,6 @@ fun EqualAssistantMainScreen() {
 
     LaunchedEffect(Unit) {
         AssistantBridge.promptInTextBoxCallback = { text ->
-            // Don't overwrite the user's manual typing with empty string resets
             if (text.isNotBlank() || universalInput.startsWith("🎤")) {
                 universalInput = text
             }
@@ -866,8 +956,9 @@ fun EqualAssistantMainScreen() {
         bottomBar = {
             NavigationBar {
                 NavigationBarItem(selected = selectedTab == 0, onClick = { selectedTab = 0 }, icon = { Icon(Icons.Default.Notifications, null) }, label = { Text("Alerts") })
-                NavigationBarItem(selected = selectedTab == 1, onClick = { selectedTab = 1 }, icon = { Icon(Icons.Default.PhoneCallback, null) }, label = { Text("Calls") })
-                NavigationBarItem(selected = selectedTab == 2, onClick = { selectedTab = 2 }, icon = { Icon(Icons.Default.Settings, null) }, label = { Text("Setup") })
+                NavigationBarItem(selected = selectedTab == 1, onClick = { selectedTab = 1 }, icon = { Icon(Icons.Default.Schedule, null) }, label = { Text("Scheduler") })
+                NavigationBarItem(selected = selectedTab == 2, onClick = { selectedTab = 2 }, icon = { Icon(Icons.Default.PhoneCallback, null) }, label = { Text("Calls") })
+                NavigationBarItem(selected = selectedTab == 3, onClick = { selectedTab = 3 }, icon = { Icon(Icons.Default.Settings, null) }, label = { Text("Setup") })
             }
         }
     ) { padding ->
@@ -878,7 +969,7 @@ fun EqualAssistantMainScreen() {
                 OutlinedTextField(
                     value = universalInput,
                     onValueChange = { universalInput = it },
-                    placeholder = { Text("Spoken text appears here...") },
+                    placeholder = { Text("Live spoken words appear here...") },
                     modifier = Modifier.weight(1f),
                     shape = RoundedCornerShape(12.dp)
                 )
@@ -900,7 +991,8 @@ fun EqualAssistantMainScreen() {
 
             when (selectedTab) {
                 0 -> NotificationsTab()
-                1 -> CallsAndSummariesTab()
+                1 -> SchedulerTab(context = context)
+                2 -> CallsAndSummariesTab()
                 else -> SetupTab(
                     context = context,
                     apiKey = apiKey,
@@ -917,6 +1009,10 @@ fun EqualAssistantMainScreen() {
     }
 }
 
+// ============================================================================
+// 9. TAB IMPLEMENTATIONS
+// ============================================================================
+
 @Composable
 fun NotificationsTab() {
     Column(modifier = Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -930,7 +1026,7 @@ fun NotificationsTab() {
             }
         }
 
-        Text("Live Notifications", fontWeight = FontWeight.Bold)
+        Text("Live Notifications (${AssistantBridge.notifications.size})", fontWeight = FontWeight.Bold)
         LazyColumn(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             items(AssistantBridge.notifications) { item ->
                 Card(modifier = Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = Color.White)) {
@@ -942,6 +1038,175 @@ fun NotificationsTab() {
                         Spacer(Modifier.height(4.dp))
                         Text(item.message, fontSize = 13.sp)
                     }
+                }
+            }
+        }
+
+        Text("Action & Diagnostic Logs", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+        LazyColumn(
+            modifier = Modifier.fillMaxWidth().height(100.dp).clip(RoundedCornerShape(8.dp)).background(Color(0xFF1E293B)).padding(8.dp)
+        ) {
+            items(AssistantBridge.commandLogs) { log -> Text(log, color = Color(0xFF10B981), fontSize = 11.sp) }
+        }
+    }
+}
+
+@Composable
+fun SchedulerTab(context: Context) {
+    var target by remember { mutableStateOf("") }
+    var message by remember { mutableStateOf("") }
+    var actionType by remember { mutableStateOf("WHATSAPP") }
+    val selectedCalendar by remember { mutableStateOf(Calendar.getInstance()) }
+    var attachmentUriString by remember { mutableStateOf<String?>(null) }
+
+    val contactPicker = rememberLauncherForActivityResult(ActivityResultContracts.PickContact()) { uri ->
+        uri?.let {
+            val cursor = context.contentResolver.query(it, null, null, null, null)
+            cursor?.use { c ->
+                if (c.moveToFirst()) {
+                    val id = c.getString(c.getColumnIndexOrThrow(ContactsContract.Contacts._ID))
+                    val pCursor = context.contentResolver.query(
+                        ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                        null,
+                        "${ContactsContract.CommonDataKinds.Phone.CONTACT_ID} = ?",
+                        arrayOf(id),
+                        null
+                    )
+                    pCursor?.use { pc ->
+                        if (pc.moveToFirst()) {
+                            target = pc.getString(pc.getColumnIndexOrThrow(ContactsContract.CommonDataKinds.Phone.NUMBER))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        attachmentUriString = uri?.toString()
+    }
+
+    Column(
+        modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Text("Schedule Action", fontWeight = FontWeight.Bold, fontSize = 17.sp)
+
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            listOf("WHATSAPP" to "WhatsApp", "CALL_SPEAK" to "Call & Speak", "SMS" to "SMS").forEach { (k, v) ->
+                FilterChip(selected = actionType == k, onClick = { actionType = k }, label = { Text(v) })
+            }
+        }
+
+        Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(
+                value = target,
+                onValueChange = { target = it },
+                label = { Text("Contact Number or Name") },
+                modifier = Modifier.weight(1f),
+                singleLine = true
+            )
+            IconButton(onClick = { contactPicker.launch(null) }) {
+                Icon(Icons.Default.Contacts, contentDescription = "Import Contact", tint = Color(0xFF10B981))
+            }
+        }
+
+        Column {
+            OutlinedTextField(
+                value = message,
+                onValueChange = { message = it },
+                label = { Text("Message text or text to speak") },
+                modifier = Modifier.fillMaxWidth()
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                IconButton(onClick = { filePicker.launch("*/*") }) {
+                    Icon(Icons.Default.AttachFile, contentDescription = "Attach File")
+                }
+                IconButton(onClick = {
+                    val recordIntent = Intent(MediaStore.Audio.Media.RECORD_SOUND_ACTION)
+                    context.startActivity(Intent.createChooser(recordIntent, "Record Audio"))
+                }) {
+                    Icon(Icons.Default.Mic, contentDescription = "Record Audio")
+                }
+                IconButton(onClick = {
+                    val videoIntent = Intent(MediaStore.ACTION_VIDEO_CAPTURE)
+                    context.startActivity(Intent.createChooser(videoIntent, "Record Video"))
+                }) {
+                    Icon(Icons.Default.Videocam, contentDescription = "Record Video")
+                }
+                attachmentUriString?.let {
+                    Text("Attachment ready", color = Color(0xFF10B981), fontSize = 11.sp)
+                }
+            }
+        }
+
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(
+                onClick = {
+                    val now = Calendar.getInstance()
+                    DatePickerDialog(context, { _, y, m, d ->
+                        selectedCalendar.set(Calendar.YEAR, y)
+                        selectedCalendar.set(Calendar.MONTH, m)
+                        selectedCalendar.set(Calendar.DAY_OF_MONTH, d)
+                    }, now.get(Calendar.YEAR), now.get(Calendar.MONTH), now.get(Calendar.DAY_OF_MONTH)).show()
+                },
+                modifier = Modifier.weight(1f),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0F172A))
+            ) {
+                Icon(Icons.Default.CalendarMonth, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(4.dp))
+                Text("Pick Date")
+            }
+
+            Button(
+                onClick = {
+                    val now = Calendar.getInstance()
+                    TimePickerDialog(context, { _, h, min ->
+                        selectedCalendar.set(Calendar.HOUR_OF_DAY, h)
+                        selectedCalendar.set(Calendar.MINUTE, min)
+                        selectedCalendar.set(Calendar.SECOND, 0)
+                    }, now.get(Calendar.HOUR_OF_DAY), now.get(Calendar.MINUTE), false).show()
+                },
+                modifier = Modifier.weight(1f),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0F172A))
+            ) {
+                Icon(Icons.Default.AccessTime, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(4.dp))
+                Text("Pick Time")
+            }
+        }
+
+        Text(
+            "Selected: ${SimpleDateFormat("dd MMM yyyy, hh:mm a", Locale.getDefault()).format(selectedCalendar.time)}",
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Bold,
+            color = Color(0xFF10B981)
+        )
+
+        Button(
+            onClick = {
+                ActionExecutor.scheduleTask(context, actionType, target, message, selectedCalendar.timeInMillis, attachmentUriString)
+                target = ""
+                message = ""
+                attachmentUriString = null
+            },
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981))
+        ) {
+            Text("Schedule Task")
+        }
+
+        HorizontalDivider(Modifier.padding(vertical = 4.dp))
+        Text("Scheduled Queue", fontWeight = FontWeight.Bold)
+        AssistantBridge.scheduledTasks.forEach { task ->
+            Card(modifier = Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = Color.White)) {
+                Column(modifier = Modifier.padding(10.dp)) {
+                    Text("${task.actionType} to ${task.target} at ${task.timeLabel}", fontWeight = FontWeight.Bold)
+                    Text(task.message, fontSize = 12.sp, color = Color.Gray)
                 }
             }
         }
@@ -981,25 +1246,51 @@ fun SetupTab(
     savedUser: String, onUserChange: (String) -> Unit,
     savedPass: String, onPassChange: (String) -> Unit
 ) {
-    val roleLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) {}
+    val roleLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        AssistantBridge.log("Role prompt completed")
+    }
 
     Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text("1. Required System Permissions", fontWeight = FontWeight.Bold)
 
-        // NEW: Assign Caller ID & Spam Role (Required for CallScreeningService)
+        // Resilient Caller ID role button with automatic OEM fallback
         Button(
             onClick = {
+                var launchedRoleDialog = false
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    val roleManager = context.getSystemService(Context.ROLE_SERVICE) as RoleManager
-                    if (roleManager.isRoleAvailable(RoleManager.ROLE_CALL_SCREENING)) {
-                        roleLauncher.launch(roleManager.createRequestRoleIntent(RoleManager.ROLE_CALL_SCREENING))
+                    val roleManager = context.getSystemService(Context.ROLE_SERVICE) as? RoleManager
+                    if (roleManager != null && roleManager.isRoleAvailable(RoleManager.ROLE_CALL_SCREENING)) {
+                        if (!roleManager.isRoleHeld(RoleManager.ROLE_CALL_SCREENING)) {
+                            try {
+                                roleLauncher.launch(roleManager.createRequestRoleIntent(RoleManager.ROLE_CALL_SCREENING))
+                                launchedRoleDialog = true
+                            } catch (e: Exception) {}
+                        } else {
+                            AssistantBridge.log("Caller ID role is already granted!")
+                            launchedRoleDialog = true
+                        }
+                    }
+                }
+                // Fallback for OEMs where direct role dialog is hidden
+                if (!launchedRoleDialog) {
+                    try {
+                        val fallbackIntent = Intent(Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS)
+                        context.startActivity(fallbackIntent)
+                        AssistantBridge.log("Opened Default Apps. Tap 'Caller ID & spam' and select Equal AI.")
+                    } catch (e: Exception) {
+                        val appDetailsIntent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                            data = Uri.parse("package:${context.packageName}")
+                        }
+                        context.startActivity(appDetailsIntent)
                     }
                 }
             },
             modifier = Modifier.fillMaxWidth(),
             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981))
         ) {
-            Text("Enable Caller ID & Spam App Role (Required for Calls)")
+            Icon(Icons.Default.Shield, contentDescription = null, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(6.dp))
+            Text("Enable Caller ID & Spam Role (For Calls)")
         }
 
         Button(onClick = { context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0F172A))) {
