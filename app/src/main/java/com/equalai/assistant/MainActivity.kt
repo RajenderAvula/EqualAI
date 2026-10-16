@@ -1,15 +1,32 @@
 package com.equalai.assistant
 
 import android.Manifest
+import android.accessibilityservice.AccessibilityService
+import android.app.AlarmManager
+import android.app.Notification
+import android.app.PendingIntent
+import android.app.RemoteInput
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.provider.ContactsContract
+import android.provider.Settings
+import android.service.notification.NotificationListenerService
+import android.service.notification.StatusBarNotification
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.telecom.Call
 import android.telecom.CallScreeningService
+import android.telephony.SmsManager
+import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -35,21 +52,302 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.*
 
-// 1. Background Android Call Screening Service
+// ============================================================================
+// 1. DATA MODELS & CENTRAL REPOSITORY
+// ============================================================================
+
+data class AppNotificationItem(
+    val key: String,
+    val packageName: String,
+    val appName: String,
+    val sender: String,
+    val message: String,
+    val timestamp: String,
+    val replyAction: Notification.Action? = null
+)
+
+data class ScheduledActionItem(
+    val id: Int = (System.currentTimeMillis() % Int.MAX_VALUE).toInt(),
+    val actionType: String, // "CALL_SPEAK", "WHATSAPP", "SMS"
+    val target: String,
+    val message: String,
+    val timeLabel: String
+)
+
+object AssistantBridge {
+    val notifications = mutableStateListOf<AppNotificationItem>()
+    val scheduledTasks = mutableStateListOf<ScheduledActionItem>()
+    val commandLogs = mutableStateListOf<String>()
+
+    var readNotificationsAloud by mutableStateOf(true)
+    var latestNotification: AppNotificationItem? = null
+
+    // Callbacks registered by MainActivity for TTS + Voice loop
+    var speakAndPromptCallback: ((String, Boolean) -> Unit)? = null
+
+    // Pending Accessibility tasks
+    var pendingLoginUser: String? = null
+    var pendingLoginPass: String? = null
+    var autoClickSendUntil: Long = 0L
+
+    // Reference to active NotificationListenerService
+    var notificationService: EqualNotificationService? = null
+
+    fun log(msg: String) {
+        val time = SimpleDateFormat("hh:mm:ss a", Locale.getDefault()).format(Date())
+        commandLogs.add(0, "[$time] $msg")
+    }
+}
+
+// ============================================================================
+// 2. NOTIFICATION LISTENER SERVICE (Reads Aloud + Inline Replies + Dismiss)
+// ============================================================================
+
+class EqualNotificationService : NotificationListenerService() {
+
+    override fun onListenerConnected() {
+        super.onListenerConnected()
+        AssistantBridge.notificationService = this
+        AssistantBridge.log("Notification Reader connected.")
+    }
+
+    override fun onListenerDisconnected() {
+        super.onListenerDisconnected()
+        if (AssistantBridge.notificationService == this) {
+            AssistantBridge.notificationService = null
+        }
+    }
+
+    override fun onNotificationPosted(sbn: StatusBarNotification?) {
+        if (sbn == null || sbn.isOngoing) return
+        val pkg = sbn.packageName ?: return
+        if (pkg == packageName || pkg == "android" || pkg.contains("systemui")) return
+
+        val extras = sbn.notification?.extras ?: return
+        val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString() ?: ""
+        val text = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString() ?: ""
+        if (title.isBlank() && text.isBlank()) return
+
+        // Avoid repeating identical consecutive notifications
+        val latest = AssistantBridge.latestNotification
+        if (latest != null && latest.sender == title && latest.message == text) return
+
+        val appName = try {
+            val info = packageManager.getApplicationInfo(pkg, 0)
+            packageManager.getApplicationLabel(info).toString()
+        } catch (e: Exception) {
+            pkg.substringAfterLast('.')
+        }
+
+        // Find inline reply action (WhatsApp, Messages, Telegram, Instagram, etc.)
+        val replyAction = sbn.notification?.actions?.firstOrNull { action ->
+            action.remoteInputs?.isNotEmpty() == true
+        }
+
+        val time = SimpleDateFormat("hh:mm a", Locale.getDefault()).format(Date())
+        val item = AppNotificationItem(
+            key = sbn.key,
+            packageName = pkg,
+            appName = appName,
+            sender = title.ifBlank { appName },
+            message = text,
+            timestamp = time,
+            replyAction = replyAction
+        )
+
+        Handler(Looper.getMainLooper()).post {
+            AssistantBridge.latestNotification = item
+            AssistantBridge.notifications.add(0, item)
+            if (AssistantBridge.readNotificationsAloud) {
+                val speech = "Notification from $appName. ${item.sender} says: ${item.message}. What would you like to do next?"
+                AssistantBridge.speakAndPromptCallback?.invoke(speech, true)
+            }
+        }
+    }
+
+    fun dismissLatest() {
+        val target = AssistantBridge.latestNotification ?: AssistantBridge.notifications.firstOrNull()
+        if (target != null) {
+            cancelNotification(target.key)
+            AssistantBridge.notifications.remove(target)
+            AssistantBridge.log("Dismissed notification from ${target.sender}")
+        }
+    }
+
+    fun replyToLatest(replyText: String): Boolean {
+        val target = AssistantBridge.latestNotification ?: AssistantBridge.notifications.firstOrNull()
+        val action = target?.replyAction ?: return false
+        val remoteInputs = action.remoteInputs ?: return false
+
+        val intent = Intent()
+        val bundle = Bundle()
+        for (input in remoteInputs) {
+            bundle.putCharSequence(input.resultKey, replyText)
+        }
+        RemoteInput.addResultsToIntent(remoteInputs, intent, bundle)
+        return try {
+            action.actionIntent.send(this, 0, intent)
+            AssistantBridge.log("Replied to ${target.sender}: $replyText")
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
+}
+
+// ============================================================================
+// 3. ACCESSIBILITY SERVICE (Auto-Login Credentials + WhatsApp Auto-Send)
+// ============================================================================
+
+class EqualAccessibilityService : AccessibilityService() {
+
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        val root = rootInActiveWindow ?: return
+
+        // A. Handle Auto-Click "Send" in WhatsApp when triggered by voice/scheduler
+        if (System.currentTimeMillis() < AssistantBridge.autoClickSendUntil) {
+            val sendNodes = root.findAccessibilityNodeInfosByViewId("com.whatsapp:id/send")
+                .ifEmpty { root.findAccessibilityNodeInfosByText("Send") }
+
+            for (node in sendNodes) {
+                if (node.isClickable && node.ContentDescriptionOrText().contains("Send", ignoreCase = true)) {
+                    node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                    AssistantBridge.autoClickSendUntil = 0L
+                    AssistantBridge.log("Auto-clicked Send button.")
+                    break
+                }
+            }
+        }
+
+        // B. Handle Auto-Login when credentials are provided by voice
+        val user = AssistantBridge.pendingLoginUser
+        val pass = AssistantBridge.pendingLoginPass
+        if (!user.isNullOrBlank() || !pass.isNullOrBlank()) {
+            performAutoLoginOnNodeTree(root, user ?: "", pass ?: "")
+        }
+    }
+
+    private fun performAutoLoginOnNodeTree(root: AccessibilityNodeInfo, user: String, pass: String) {
+        val editNodes = mutableListOf<AccessibilityNodeInfo>()
+        val clickableNodes = mutableListOf<AccessibilityNodeInfo>()
+        collectNodes(root, editNodes, clickableNodes)
+
+        if (editNodes.isEmpty()) return
+
+        var filledAny = false
+        val passwordNode = editNodes.firstOrNull { it.isPassword }
+        val usernameNode = editNodes.firstOrNull { !it.isPassword }
+
+        if (usernameNode != null && user.isNotBlank()) {
+            val args = Bundle().apply {
+                putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, user)
+            }
+            usernameNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+            filledAny = true
+        }
+
+        if (passwordNode != null && pass.isNotBlank()) {
+            val args = Bundle().apply {
+                putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, pass)
+            }
+            passwordNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+            filledAny = true
+        } else if (editNodes.size >= 2 && pass.isNotBlank()) {
+            val args = Bundle().apply {
+                putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, pass)
+            }
+            editNodes[1].performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+            filledAny = true
+        }
+
+        if (filledAny) {
+            AssistantBridge.pendingLoginUser = null
+            AssistantBridge.pendingLoginPass = null
+            AssistantBridge.log("Filled login credentials on screen.")
+
+            // Click Login / Sign In / Submit button if visible
+            val loginBtn = clickableNodes.firstOrNull { node ->
+                val label = node.ContentDescriptionOrText().lowercase()
+                label.contains("log in") || label.contains("login") ||
+                    label.contains("sign in") || label.contains("submit") ||
+                    label.contains("continue")
+            }
+            loginBtn?.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        }
+    }
+
+    private fun collectNodes(
+        node: AccessibilityNodeInfo?,
+        edits: MutableList<AccessibilityNodeInfo>,
+        clickables: MutableList<AccessibilityNodeInfo>
+    ) {
+        if (node == null) return
+        if (node.isEditable || node.className?.toString()?.contains("EditText") == true) {
+            edits.add(node)
+        }
+        if (node.isClickable) {
+            clickables.add(node)
+        }
+        for (i in 0 until node.childCount) {
+            collectNodes(node.getChild(i), edits, clickables)
+        }
+    }
+
+    private fun AccessibilityNodeInfo.ContentDescriptionOrText(): String {
+        return "${this.text ?: ""} ${this.contentDescription ?: ""}".trim()
+    }
+
+    override fun onInterrupt() {}
+}
+
+// ============================================================================
+// 4. SCHEDULED TASK RECEIVER (Executes Calls, TTS Speech, WhatsApp, or SMS on Timer)
+// ============================================================================
+
+class ScheduledTaskReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        val actionType = intent.getStringExtra("actionType") ?: return
+        val target = intent.getStringExtra("target") ?: ""
+        val message = intent.getStringExtra("message") ?: ""
+
+        AssistantBridge.log("Executing scheduled task: $actionType -> $target")
+
+        when (actionType) {
+            "SMS" -> ActionExecutor.sendSms(context, target, message)
+            "WHATSAPP" -> ActionExecutor.sendWhatsApp(context, target, message)
+            "CALL_SPEAK" -> {
+                ActionExecutor.makePhoneCall(context, target)
+                // Wait 8 seconds for call pickup, then speak message aloud
+                CoroutineScope(Dispatchers.Main).launch {
+                    delay(8000)
+                    AssistantBridge.speakAndPromptCallback?.invoke(message, false)
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// 5. CALL SCREENING SERVICE
+// ============================================================================
+
 class EqualCallScreeningService : CallScreeningService() {
     override fun onScreenCall(callDetails: Call.Details) {
         val phoneNumber = callDetails.handle?.schemeSpecificPart ?: "Unknown Number"
-        CallRepository.onIncomingSystemCall(phoneNumber)
+        AssistantBridge.log("Incoming call detected from $phoneNumber")
 
         val response = CallResponse.Builder()
             .setDisallowCall(false)
@@ -62,59 +360,183 @@ class EqualCallScreeningService : CallScreeningService() {
     }
 }
 
-// 2. Data Models & In-Memory Store
-data class TranscriptTurn(val speaker: String, val text: String)
+// ============================================================================
+// 6. ACTION EXECUTOR & GEMINI AI COMMAND ROUTER
+// ============================================================================
 
-data class ScreenedCall(
-    val id: String = UUID.randomUUID().toString(),
-    val callerName: String,
-    val phoneNumber: String,
-    val timestamp: String,
-    val transcript: List<TranscriptTurn>,
-    val summary: String,
-    val actionItems: List<String>,
-    val category: String
-)
+object ActionExecutor {
 
-object CallRepository {
-    val calls = mutableStateListOf(
-        ScreenedCall(
-            callerName = "Amazon Courier",
-            phoneNumber = "+91 98480 12345",
-            timestamp = "Today, 2:15 PM",
-            transcript = listOf(
-                TranscriptTurn("Equal AI", "Hello! My owner is currently busy. Who is calling and how can I help?"),
-                TranscriptTurn("Caller", "I am at the gate with a package. Should I leave it with security?"),
-                TranscriptTurn("Equal AI", "Yes, please leave the parcel with the guard at the main gate. Thank you!")
-            ),
-            summary = "Delivery executive called with a package at the main gate. Advised to leave it with security.",
-            actionItems = listOf("Pick up parcel at gate", "Call +91 98480 12345"),
-            category = "Delivery"
-        )
-    )
-
-    fun onIncomingSystemCall(number: String) {
-        val time = SimpleDateFormat("hh:mm a", Locale.getDefault()).format(Date())
-        calls.add(
-            0,
-            ScreenedCall(
-                callerName = "Incoming Call",
-                phoneNumber = number,
-                timestamp = "Today, $time",
-                transcript = emptyList(),
-                summary = "System call detected. Tap 'Screen Call' to answer with Equal AI.",
-                actionItems = listOf("Call back $number"),
-                category = "Incoming"
+    fun resolveContactNumber(context: Context, nameOrNumber: String): String {
+        val cleaned = nameOrNumber.trim()
+        if (cleaned.any { it.isDigit() } && cleaned.length >= 6) {
+            return cleaned.filter { it.isDigit() || it == '+' }
+        }
+        return try {
+            val cursor = context.contentResolver.query(
+                ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                arrayOf(
+                    ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                    ContactsContract.CommonDataKinds.Phone.NUMBER
+                ),
+                "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} LIKE ?",
+                arrayOf("%$cleaned%"),
+                null
             )
+            cursor?.use {
+                if (it.moveToFirst()) {
+                    val numberIdx = it.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER)
+                    if (numberIdx >= 0) return it.getString(numberIdx)
+                }
+            }
+            cleaned
+        } catch (e: Exception) {
+            cleaned
+        }
+    }
+
+    fun makePhoneCall(context: Context, target: String) {
+        val number = resolveContactNumber(context, target)
+        try {
+            val intent = Intent(Intent.ACTION_CALL, Uri.parse("tel:$number")).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(intent)
+            AssistantBridge.log("Calling $number")
+        } catch (e: Exception) {
+            val dialIntent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:$number")).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(dialIntent)
+        }
+    }
+
+    fun sendSms(context: Context, target: String, message: String) {
+        val number = resolveContactNumber(context, target)
+        try {
+            val smsManager = context.getSystemService(SmsManager::class.java) ?: SmsManager.getDefault()
+            smsManager.sendTextMessage(number, null, message, null, null)
+            AssistantBridge.log("Sent SMS to $number: $message")
+        } catch (e: Exception) {
+            val intent = Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:$number")).apply {
+                putExtra("sms_body", message)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(intent)
+        }
+    }
+
+    fun sendWhatsApp(context: Context, target: String, message: String) {
+        // If target is empty and we have an active WhatsApp notification, reply inline first
+        if (target.isBlank() && AssistantBridge.notificationService?.replyToLatest(message) == true) {
+            return
+        }
+        var number = resolveContactNumber(context, target).filter { it.isDigit() }
+        if (number.length == 10) number = "91$number" // Default India prefix if 10 digits
+
+        try {
+            AssistantBridge.autoClickSendUntil = System.currentTimeMillis() + 7000L
+            val encoded = URLEncoder.encode(message, "UTF-8")
+            val uri = Uri.parse("https://api.whatsapp.com/send?phone=$number&text=$encoded")
+            val intent = Intent(Intent.ACTION_VIEW, uri).apply {
+                setPackage("com.whatsapp")
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(intent)
+            AssistantBridge.log("Opening WhatsApp for $number")
+        } catch (e: Exception) {
+            AssistantBridge.log("WhatsApp error: ${e.localizedMessage}")
+        }
+    }
+
+    fun sendEmail(context: Context, toEmail: String, subject: String, body: String) {
+        try {
+            val uri = Uri.parse(
+                "mailto:${toEmail.trim()}?subject=${Uri.encode(subject)}&body=${Uri.encode(body)}"
+            )
+            val intent = Intent(Intent.ACTION_SENDTO, uri).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(intent)
+            AssistantBridge.log("Opened email to $toEmail")
+        } catch (e: Exception) {
+            AssistantBridge.log("Email error: ${e.localizedMessage}")
+        }
+    }
+
+    fun openAppByName(context: Context, spokenAppName: String): Boolean {
+        val pm = context.packageManager
+        val cleanName = spokenAppName.trim().lowercase()
+        val packages = pm.getInstalledApplications(0)
+
+        val matchedApp = packages.firstOrNull { appInfo ->
+            val label = pm.getApplicationLabel(appInfo).toString().lowercase()
+            label == cleanName || label.contains(cleanName) || appInfo.packageName.lowercase().contains(cleanName)
+        }
+
+        if (matchedApp != null) {
+            val launchIntent = pm.getLaunchIntentForPackage(matchedApp.packageName)
+            if (launchIntent != null) {
+                launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                context.startActivity(launchIntent)
+                AssistantBridge.log("Opened app: ${pm.getApplicationLabel(matchedApp)}")
+                return true
+            }
+        }
+        AssistantBridge.log("Could not find installed app matching '$spokenAppName'")
+        return false
+    }
+
+    fun scheduleTask(
+        context: Context,
+        actionType: String,
+        target: String,
+        message: String,
+        delayMinutes: Int,
+        hour: Int,
+        minute: Int
+    ) {
+        val cal = Calendar.getInstance()
+        if (hour in 0..23 && minute in 0..59) {
+            cal.set(Calendar.HOUR_OF_DAY, hour)
+            cal.set(Calendar.MINUTE, minute)
+            cal.set(Calendar.SECOND, 0)
+            if (cal.timeInMillis <= System.currentTimeMillis()) {
+                cal.add(Calendar.DAY_OF_YEAR, 1)
+            }
+        } else {
+            cal.add(Calendar.MINUTE, delayMinutes.coerceAtLeast(1))
+        }
+
+        val item = ScheduledActionItem(
+            actionType = actionType,
+            target = target,
+            message = message,
+            timeLabel = SimpleDateFormat("hh:mm a", Locale.getDefault()).format(cal.time)
         )
+        AssistantBridge.scheduledTasks.add(0, item)
+
+        val intent = Intent(context, ScheduledTaskReceiver::class.java).apply {
+            putExtra("actionType", actionType)
+            putExtra("target", target)
+            putExtra("message", message)
+        }
+        val pi = PendingIntent.getBroadcast(
+            context,
+            item.id,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        try {
+            alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, cal.timeInMillis, pi)
+        } catch (e: SecurityException) {
+            alarmManager.set(AlarmManager.RTC_WAKEUP, cal.timeInMillis, pi)
+        }
+        AssistantBridge.log("Scheduled $actionType to $target at ${item.timeLabel}")
     }
 }
 
-// 3. Direct REST Client for Gemini API (No deprecated SDK issues)
-fun callGeminiRestApi(apiKey: String, modelName: String, promptText: String): String {
-    if (apiKey.isBlank()) {
-        return "Missing API Key: Open the 'Tell Equal' tab and paste your Google AI Studio API Key."
-    }
+fun callGeminiRaw(apiKey: String, modelName: String, promptText: String): String {
     val cleanModel = modelName.trim().removePrefix("models/")
     val endpoint = "https://generativelanguage.googleapis.com/v1beta/models/$cleanModel:generateContent?key=${apiKey.trim()}"
     val conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
@@ -129,47 +551,149 @@ fun callGeminiRestApi(apiKey: String, modelName: String, promptText: String): St
         put(
             "contents",
             JSONArray().put(
-                JSONObject().put(
-                    "parts",
-                    JSONArray().put(JSONObject().put("text", promptText))
-                )
+                JSONObject().put("parts", JSONArray().put(JSONObject().put("text", promptText)))
             )
         )
     }
 
-    conn.outputStream.use { os ->
-        os.write(payload.toString().toByteArray(Charsets.UTF_8))
-    }
-
+    conn.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
     val code = conn.responseCode
     val stream = if (code in 200..299) conn.inputStream else conn.errorStream
     val body = stream?.bufferedReader()?.use { it.readText() } ?: ""
 
-    if (code !in 200..299) {
-        return "API Error ($code): Check model name ($cleanModel) or API key."
-    }
+    if (code !in 200..299) return "{\"action\":\"SPEAK_ONLY\",\"spoken_confirm\":\"API Error $code. Check your Gemini API key.\"}"
 
     val json = JSONObject(body)
     val candidates = json.optJSONArray("candidates")
     if (candidates != null && candidates.length() > 0) {
         val parts = candidates.getJSONObject(0).optJSONObject("content")?.optJSONArray("parts")
         if (parts != null && parts.length() > 0) {
-            return parts.getJSONObject(0).optString("text", "No text returned.")
+            return parts.getJSONObject(0).optString("text", "")
         }
     }
-    return "Empty response from Gemini."
+    return ""
 }
 
-// 4. Main Activity & UI
+suspend fun processVoiceCommandWithGemini(
+    context: Context,
+    spokenCommand: String,
+    apiKey: String,
+    modelName: String,
+    savedUser: String,
+    savedPass: String
+) {
+    AssistantBridge.log("Heard: \"$spokenCommand\"")
+    if (apiKey.isBlank()) {
+        AssistantBridge.speakAndPromptCallback?.invoke(
+            "Please paste your Google AI Studio API Key in the Settings tab first.",
+            false
+        )
+        return
+    }
+
+    val latestNotif = AssistantBridge.latestNotification
+    val notifContext = if (latestNotif != null) {
+        "Latest Notification -> App: ${latestNotif.appName}, Sender: ${latestNotif.sender}, Message: ${latestNotif.message}"
+    } else {
+        "No active notification"
+    }
+
+    val prompt = """
+        You are an Android system voice assistant. Parse the user's voice command into a single JSON object.
+        Current Context: $notifContext
+        Saved default login username: "$savedUser", password: "$savedPass"
+        User said: "$spokenCommand"
+
+        Return ONLY raw valid JSON (no markdown backticks) with these exact keys:
+        {
+          "action": "DISMISS_NOTIFICATION" | "REPLY_NOTIFICATION" | "SEND_SMS" | "MAKE_CALL" | "SEND_WHATSAPP" | "OPEN_APP" | "AUTO_LOGIN" | "SEND_EMAIL" | "SCHEDULE_TASK" | "SPEAK_ONLY",
+          "spoken_confirm": "Short sentence confirming what you are doing",
+          "target": "phone number, contact name, email address, app name to open, or username for login",
+          "secondary_target": "password for login, email subject, or scheduled sub-action (CALL_SPEAK, WHATSAPP, SMS)",
+          "message": "message text to send or speak",
+          "delay_minutes": 0,
+          "scheduled_hour": -1,
+          "scheduled_minute": -1
+        }
+        Rules:
+        - If user says "close", "dismiss", or "ignore", use DISMISS_NOTIFICATION.
+        - If user says "reply [text]" to the notification, use REPLY_NOTIFICATION.
+        - If user asks to schedule talking/calling or messaging at a time (e.g. "at 5:30 PM" or "in 10 minutes"), use SCHEDULE_TASK and set secondary_target to "CALL_SPEAK", "WHATSAPP", or "SMS", and set scheduled_hour (0-23) & scheduled_minute (0-59) or delay_minutes.
+        - If user asks to login, use AUTO_LOGIN, put username in target and password in secondary_target (use saved defaults if user didn't speak new ones).
+    """.trimIndent()
+
+    val rawResponse = withContext(Dispatchers.IO) {
+        try {
+            callGeminiRaw(apiKey, modelName, prompt)
+        } catch (e: Exception) {
+            "{\"action\":\"SPEAK_ONLY\",\"spoken_confirm\":\"Network error: ${e.localizedMessage}\"}"
+        }
+    }
+
+    val cleanedJson = rawResponse.replace("```json", "").replace("```", "").trim()
+    try {
+        val obj = JSONObject(cleanedJson)
+        val action = obj.optString("action", "SPEAK_ONLY")
+        val confirm = obj.optString("spoken_confirm", "Done.")
+        val target = obj.optString("target", "")
+        val secondary = obj.optString("secondary_target", "")
+        val message = obj.optString("message", "")
+        val delayMin = obj.optInt("delay_minutes", 0)
+        val hour = obj.optInt("scheduled_hour", -1)
+        val minute = obj.optInt("scheduled_minute", -1)
+
+        AssistantBridge.speakAndPromptCallback?.invoke(confirm, false)
+
+        withContext(Dispatchers.Main) {
+            when (action) {
+                "DISMISS_NOTIFICATION" -> AssistantBridge.notificationService?.dismissLatest()
+                "REPLY_NOTIFICATION" -> {
+                    val ok = AssistantBridge.notificationService?.replyToLatest(message) ?: false
+                    if (!ok && latestNotif != null) {
+                        ActionExecutor.sendSms(context, latestNotif.sender, message)
+                    }
+                }
+                "SEND_SMS" -> ActionExecutor.sendSms(context, target.ifBlank { latestNotif?.sender ?: "" }, message)
+                "MAKE_CALL" -> ActionExecutor.makePhoneCall(context, target.ifBlank { latestNotif?.sender ?: "" })
+                "SEND_WHATSAPP" -> ActionExecutor.sendWhatsApp(context, target, message)
+                "OPEN_APP" -> ActionExecutor.openAppByName(context, target)
+                "AUTO_LOGIN" -> {
+                    AssistantBridge.pendingLoginUser = target.ifBlank { savedUser }
+                    AssistantBridge.pendingLoginPass = secondary.ifBlank { savedPass }
+                    AssistantBridge.log("Armed Auto-Login for user: ${AssistantBridge.pendingLoginUser}")
+                }
+                "SEND_EMAIL" -> ActionExecutor.sendEmail(context, target, secondary.ifBlank { "Message from Equal AI" }, message)
+                "SCHEDULE_TASK" -> {
+                    val subType = if (secondary in listOf("CALL_SPEAK", "WHATSAPP", "SMS")) secondary else "CALL_SPEAK"
+                    ActionExecutor.scheduleTask(context, subType, target, message, delayMin, hour, minute)
+                }
+            }
+        }
+    } catch (e: Exception) {
+        AssistantBridge.speakAndPromptCallback?.invoke(rawResponse.take(160), false)
+    }
+}
+
+// ============================================================================
+// 7. MAIN ACTIVITY & JETPACK COMPOSE UI
+// ============================================================================
+
 class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
 
     private var tts: TextToSpeech? = null
     private var speechRecognizer: SpeechRecognizer? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         tts = TextToSpeech(this, this)
         speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
+
+        val prefs = getSharedPreferences("equal_prefs", Context.MODE_PRIVATE)
+
+        AssistantBridge.speakAndPromptCallback = { text, listenAfter ->
+            speakText(text, listenAfter)
+        }
 
         setContent {
             MaterialTheme(
@@ -187,17 +711,20 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                     permissionLauncher.launch(
                         arrayOf(
                             Manifest.permission.RECORD_AUDIO,
-                            Manifest.permission.READ_PHONE_STATE
+                            Manifest.permission.READ_PHONE_STATE,
+                            Manifest.permission.CALL_PHONE,
+                            Manifest.permission.SEND_SMS,
+                            Manifest.permission.READ_CONTACTS
                         )
                     )
                 }
 
-                EqualAIApp(
-                    onSpeak = { text, lang -> speakText(text, lang) },
-                    onStartListening = { lang, onResult -> startListening(lang, onResult) },
-                    onStopAudio = {
-                        tts?.stop()
-                        speechRecognizer?.stopListening()
+                EqualAssistantMainScreen(
+                    onTriggerVoiceCommand = { apiKey, model, savedUser, savedPass ->
+                        startListeningForCommand(apiKey, model, savedUser, savedPass)
+                    },
+                    onTestSpeakAndListen = {
+                        speakText("What would you like me to do next?", true)
                     }
                 )
             }
@@ -207,34 +734,55 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
             tts?.language = Locale("en", "IN")
+            tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                override fun onStart(utteranceId: String?) {}
+                override fun onDone(utteranceId: String?) {
+                    if (utteranceId == "PROMPT_LISTEN_AFTER") {
+                        val prefs = getSharedPreferences("equal_prefs", Context.MODE_PRIVATE)
+                        val apiKey = prefs.getString("api_key", BuildConfig.GEMINI_API_KEY) ?: ""
+                        val model = prefs.getString("model_name", "gemini-2.5-flash") ?: "gemini-2.5-flash"
+                        val user = prefs.getString("saved_user", "") ?: ""
+                        val pass = prefs.getString("saved_pass", "") ?: ""
+                        mainHandler.post {
+                            startListeningForCommand(apiKey, model, user, pass)
+                        }
+                    }
+                }
+                override fun onError(utteranceId: String?) {}
+            })
         }
     }
 
-    private fun speakText(text: String, language: String) {
-        val locale = when (language) {
-            "Telugu" -> Locale("te", "IN")
-            "Hindi" -> Locale("hi", "IN")
-            else -> Locale("en", "IN")
-        }
-        tts?.language = locale
-        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "EQUAL_AI_TTS")
+    private fun speakText(text: String, listenAfter: Boolean) {
+        val utteranceId = if (listenAfter) "PROMPT_LISTEN_AFTER" else "SPEAK_ONLY_ID"
+        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
     }
 
-    private fun startListening(language: String, onResult: (String) -> Unit) {
-        val langTag = when (language) {
-            "Telugu" -> "te-IN"
-            "Hindi" -> "hi-IN"
-            else -> "en-IN"
-        }
+    private fun startListeningForCommand(
+        apiKey: String,
+        modelName: String,
+        savedUser: String,
+        savedPass: String
+    ) {
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, langTag)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-IN")
         }
         speechRecognizer?.setRecognitionListener(object : RecognitionListener {
             override fun onResults(results: Bundle?) {
                 val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                 if (!matches.isNullOrEmpty()) {
-                    onResult(matches[0])
+                    val spoken = matches[0]
+                    CoroutineScope(Dispatchers.Main).launch {
+                        processVoiceCommandWithGemini(
+                            this@MainActivity,
+                            spoken,
+                            apiKey,
+                            modelName,
+                            savedUser,
+                            savedPass
+                        )
+                    }
                 }
             }
             override fun onReadyForSpeech(params: Bundle?) {}
@@ -258,24 +806,17 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun EqualAIApp(
-    onSpeak: (String, String) -> Unit,
-    onStartListening: (String, (String) -> Unit) -> Unit,
-    onStopAudio: () -> Unit
+fun EqualAssistantMainScreen(
+    onTriggerVoiceCommand: (String, String, String, String) -> Unit,
+    onTestSpeakAndListen: () -> Unit
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val prefs = remember { context.getSharedPreferences("equal_prefs", Context.MODE_PRIVATE) }
 
     var selectedTab by remember { mutableStateOf(0) }
-    var searchQuery by remember { mutableStateOf("") }
-    var customInstructions by remember {
-        mutableStateOf(
-            prefs.getString(
-                "instructions",
-                "I am in a meeting right now. Politely ask who is calling and why. If it is a courier delivery, tell them to leave the parcel at the door."
-            ) ?: ""
-        )
-    }
+    var typedCommand by remember { mutableStateOf("") }
+
     var apiKey by remember {
         mutableStateOf(
             prefs.getString("api_key", BuildConfig.GEMINI_API_KEY)?.ifBlank { BuildConfig.GEMINI_API_KEY } ?: ""
@@ -284,48 +825,28 @@ fun EqualAIApp(
     var modelName by remember {
         mutableStateOf(prefs.getString("model_name", "gemini-2.5-flash") ?: "gemini-2.5-flash")
     }
-    var selectedLanguage by remember { mutableStateOf("English") }
-    var activeCallScreen by remember { mutableStateOf(false) }
-    var selectedCallForDetail by remember { mutableStateOf<ScreenedCall?>(null) }
-
-    if (activeCallScreen) {
-        LiveCallScreen(
-            apiKey = apiKey,
-            modelName = modelName,
-            instructions = customInstructions,
-            language = selectedLanguage,
-            onSpeak = onSpeak,
-            onStartListening = onStartListening,
-            onEndCall = { newCall ->
-                onStopAudio()
-                if (newCall != null) {
-                    CallRepository.calls.add(0, newCall)
-                }
-                activeCallScreen = false
-            }
-        )
-        return
-    }
+    var savedUser by remember { mutableStateOf(prefs.getString("saved_user", "") ?: "") }
+    var savedPass by remember { mutableStateOf(prefs.getString("saved_pass", "") ?: "") }
 
     Scaffold(
         topBar = {
             TopAppBar(
                 title = {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.GraphicEq, contentDescription = null, tint = Color(0xFF10B981))
+                        Icon(Icons.Default.RecordVoiceOver, contentDescription = null, tint = Color(0xFF10B981))
                         Spacer(Modifier.width(8.dp))
-                        Text("Equal AI", fontWeight = FontWeight.Bold)
+                        Text("Equal AI Voice Agent", fontWeight = FontWeight.Bold, fontSize = 18.sp)
                     }
                 },
                 actions = {
                     Button(
-                        onClick = { activeCallScreen = true },
+                        onClick = { onTriggerVoiceCommand(apiKey, modelName, savedUser, savedPass) },
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981)),
                         modifier = Modifier.padding(end = 8.dp)
                     ) {
-                        Icon(Icons.Default.Call, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(Modifier.width(6.dp))
-                        Text("Screen Call")
+                        Icon(Icons.Default.Mic, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("Speak")
                     }
                 }
             )
@@ -335,14 +856,20 @@ fun EqualAIApp(
                 NavigationBarItem(
                     selected = selectedTab == 0,
                     onClick = { selectedTab = 0 },
-                    icon = { Icon(Icons.Default.History, contentDescription = null) },
-                    label = { Text("Calls & Summaries") }
+                    icon = { Icon(Icons.Default.NotificationsActive, contentDescription = null) },
+                    label = { Text("Notifications") }
                 )
                 NavigationBarItem(
                     selected = selectedTab == 1,
                     onClick = { selectedTab = 1 },
-                    icon = { Icon(Icons.Default.Tune, contentDescription = null) },
-                    label = { Text("Tell Equal") }
+                    icon = { Icon(Icons.Default.Schedule, contentDescription = null) },
+                    label = { Text("Scheduler") }
+                )
+                NavigationBarItem(
+                    selected = selectedTab == 2,
+                    onClick = { selectedTab = 2 },
+                    icon = { Icon(Icons.Default.Settings, contentDescription = null) },
+                    label = { Text("Setup & Keys") }
                 )
             }
         }
@@ -354,40 +881,52 @@ fun EqualAIApp(
                 .background(Color(0xFFF8FAFC))
                 .padding(16.dp)
         ) {
-            if (selectedTab == 0) {
+            // Universal Command Bar (Voice or Text)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
                 OutlinedTextField(
-                    value = searchQuery,
-                    onValueChange = { searchQuery = it },
-                    placeholder = { Text("Search calls, numbers, or transcripts...") },
-                    leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
-                    modifier = Modifier.fillMaxWidth(),
+                    value = typedCommand,
+                    onValueChange = { typedCommand = it },
+                    placeholder = { Text("Say or type: 'Open WhatsApp', 'Call...', 'At 6pm...'") },
+                    modifier = Modifier.weight(1f),
                     shape = RoundedCornerShape(12.dp),
                     singleLine = true
                 )
-
-                Spacer(Modifier.height(16.dp))
-
-                val filteredCalls = CallRepository.calls.filter { call ->
-                    call.callerName.contains(searchQuery, ignoreCase = true) ||
-                        call.phoneNumber.contains(searchQuery, ignoreCase = true) ||
-                        call.summary.contains(searchQuery, ignoreCase = true) ||
-                        call.transcript.any { it.text.contains(searchQuery, ignoreCase = true) }
-                }
-
-                LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    items(filteredCalls) { call ->
-                        CallSummaryCard(call = call, onClick = { selectedCallForDetail = call })
-                    }
-                }
-            } else {
-                TellEqualScreen(
-                    instructions = customInstructions,
-                    onInstructionsChange = {
-                        customInstructions = it
-                        prefs.edit().putString("instructions", it).apply()
+                IconButton(
+                    onClick = {
+                        if (typedCommand.isNotBlank()) {
+                            val cmd = typedCommand
+                            typedCommand = ""
+                            scope.launch {
+                                processVoiceCommandWithGemini(
+                                    context,
+                                    cmd,
+                                    apiKey,
+                                    modelName,
+                                    savedUser,
+                                    savedPass
+                                )
+                            }
+                        }
                     },
-                    selectedLanguage = selectedLanguage,
-                    onLanguageChange = { selectedLanguage = it },
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .background(Color(0xFF0F172A))
+                ) {
+                    Icon(Icons.Default.Send, contentDescription = "Run", tint = Color.White)
+                }
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            when (selectedTab) {
+                0 -> NotificationsAndLogsTab(onTestSpeakAndListen = onTestSpeakAndListen)
+                1 -> SchedulerTab(context = context)
+                2 -> SetupAndVaultTab(
+                    context = context,
                     apiKey = apiKey,
                     onApiKeyChange = {
                         apiKey = it
@@ -397,79 +936,184 @@ fun EqualAIApp(
                     onModelNameChange = {
                         modelName = it
                         prefs.edit().putString("model_name", it).apply()
+                    },
+                    savedUser = savedUser,
+                    onUserChange = {
+                        savedUser = it
+                        prefs.edit().putString("saved_user", it).apply()
+                    },
+                    savedPass = savedPass,
+                    onPassChange = {
+                        savedPass = it
+                        prefs.edit().putString("saved_pass", it).apply()
                     }
                 )
             }
         }
     }
+}
 
-    selectedCallForDetail?.let { call ->
-        AlertDialog(
-            onDismissRequest = { selectedCallForDetail = null },
-            title = { Text("${call.callerName} (${call.phoneNumber})", fontWeight = FontWeight.Bold) },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("Instant Summary:", fontWeight = FontWeight.SemiBold, color = Color(0xFF10B981))
-                    Text(call.summary, fontSize = 14.sp)
-                    HorizontalDivider(Modifier.padding(vertical = 4.dp))
-                    Text("Call Transcript:", fontWeight = FontWeight.SemiBold)
-                    call.transcript.forEach { turn ->
-                        Text("${turn.speaker}: ${turn.text}", fontSize = 13.sp)
-                    }
+@Composable
+fun NotificationsAndLogsTab(onTestSpeakAndListen: () -> Unit) {
+    Column(modifier = Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Card(
+            shape = RoundedCornerShape(14.dp),
+            colors = CardDefaults.cardColors(containerColor = Color.White),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(14.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Read All Notifications Aloud", fontWeight = FontWeight.Bold)
+                    Text(
+                        "Automatically speaks incoming alerts & asks what to do next",
+                        fontSize = 12.sp,
+                        color = Color.Gray
+                    )
                 }
-            },
-            confirmButton = {
-                TextButton(onClick = { selectedCallForDetail = null }) {
-                    Text("Close")
+                Switch(
+                    checked = AssistantBridge.readNotificationsAloud,
+                    onCheckedChange = { AssistantBridge.readNotificationsAloud = it }
+                )
+            }
+        }
+
+        Text("Live Notifications (${AssistantBridge.notifications.size})", fontWeight = FontWeight.Bold)
+
+        LazyColumn(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            if (AssistantBridge.notifications.isEmpty()) {
+                item {
+                    Text(
+                        "No notifications yet. Enable Notification Access in the Setup tab, or tap 'Test Voice Prompt' below.",
+                        color = Color.Gray,
+                        fontSize = 13.sp
+                    )
                 }
             }
-        )
+            items(AssistantBridge.notifications) { item ->
+                Card(
+                    shape = RoundedCornerShape(12.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color.White),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text("${item.appName} • ${item.sender}", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                            Text(item.timestamp, color = Color.Gray, fontSize = 11.sp)
+                        }
+                        Spacer(Modifier.height(4.dp))
+                        Text(item.message, fontSize = 13.sp)
+                    }
+                }
+            }
+        }
+
+        Text("Assistant Action Log", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(110.dp)
+                .clip(RoundedCornerShape(10.dp))
+                .background(Color(0xFF1E293B))
+                .padding(8.dp)
+        ) {
+            items(AssistantBridge.commandLogs) { log ->
+                Text(log, color = Color(0xFF10B981), fontSize = 11.sp)
+            }
+        }
     }
 }
 
 @Composable
-fun CallSummaryCard(call: ScreenedCall, onClick: () -> Unit) {
-    Card(
+fun SchedulerTab(context: Context) {
+    var target by remember { mutableStateOf("") }
+    var message by remember { mutableStateOf("") }
+    var delayMin by remember { mutableStateOf("5") }
+    var actionType by remember { mutableStateOf("CALL_SPEAK") }
+
+    Column(
         modifier = Modifier
-            .fillMaxWidth()
-            .clickable { onClick() },
-        shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(containerColor = Color.White),
-        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Column {
-                    Text(call.callerName, fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                    Text("${call.phoneNumber} • ${call.timestamp}", color = Color.Gray, fontSize = 12.sp)
-                }
-                Surface(color = Color(0xFFECFDF5), shape = RoundedCornerShape(8.dp)) {
-                    Text(
-                        text = call.category,
-                        color = Color(0xFF059669),
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Medium,
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                    )
-                }
+        Text("Schedule Voice Call, WhatsApp, or SMS", fontWeight = FontWeight.Bold, fontSize = 17.sp)
+        Text(
+            "You can schedule by voice (e.g. 'At 6:30 PM WhatsApp Rahul saying I am ready') or add manually below:",
+            fontSize = 13.sp,
+            color = Color.Gray
+        )
+
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            listOf("CALL_SPEAK" to "Call & Speak", "WHATSAPP" to "WhatsApp", "SMS" to "SMS").forEach { (key, label) ->
+                FilterChip(
+                    selected = actionType == key,
+                    onClick = { actionType = key },
+                    label = { Text(label) }
+                )
             }
+        }
 
-            Spacer(Modifier.height(10.dp))
-            Text(call.summary, fontSize = 14.sp, color = Color(0xFF334155))
+        OutlinedTextField(
+            value = target,
+            onValueChange = { target = it },
+            label = { Text("Contact Name or Phone Number") },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true
+        )
 
-            if (call.actionItems.isNotEmpty()) {
-                Spacer(Modifier.height(10.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    call.actionItems.take(2).forEach { action ->
-                        SuggestionChip(
-                            onClick = {},
-                            label = { Text(action, fontSize = 12.sp) }
-                        )
-                    }
+        OutlinedTextField(
+            value = message,
+            onValueChange = { message = it },
+            label = { Text("Text to Speak or Message to Send") },
+            modifier = Modifier.fillMaxWidth()
+        )
+
+        OutlinedTextField(
+            value = delayMin,
+            onValueChange = { delayMin = it },
+            label = { Text("Run in how many minutes?") },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true
+        )
+
+        Button(
+            onClick = {
+                val mins = delayMin.toIntOrNull() ?: 1
+                ActionExecutor.scheduleTask(context, actionType, target, message, mins, -1, -1)
+                target = ""
+                message = ""
+            },
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981))
+        ) {
+            Icon(Icons.Default.AlarmAdd, contentDescription = null)
+            Spacer(Modifier.width(8.dp))
+            Text("Schedule Task")
+        }
+
+        HorizontalDivider(Modifier.padding(vertical = 6.dp))
+        Text("Upcoming Scheduled Tasks", fontWeight = FontWeight.Bold)
+
+        AssistantBridge.scheduledTasks.forEach { item ->
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color.White)
+            ) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    Text("${item.actionType} -> ${item.target} at ${item.timeLabel}", fontWeight = FontWeight.Bold)
+                    Text(item.message, fontSize = 13.sp, color = Color.DarkGray)
                 }
             }
         }
@@ -477,64 +1121,80 @@ fun CallSummaryCard(call: ScreenedCall, onClick: () -> Unit) {
 }
 
 @Composable
-fun TellEqualScreen(
-    instructions: String,
-    onInstructionsChange: (String) -> Unit,
-    selectedLanguage: String,
-    onLanguageChange: (String) -> Unit,
+fun SetupAndVaultTab(
+    context: Context,
     apiKey: String,
     onApiKeyChange: (String) -> Unit,
     modelName: String,
-    onModelNameChange: (String) -> Unit
+    onModelNameChange: (String) -> Unit,
+    savedUser: String,
+    onUserChange: (String) -> Unit,
+    savedPass: String,
+    onPassChange: (String) -> Unit
 ) {
     Column(
         modifier = Modifier
             .fillMaxSize()
             .verticalScroll(rememberScrollState()),
-        verticalArrangement = Arrangement.spacedBy(14.dp)
+        verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Text("Tell Equal How to Answer", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+        Text("1. One-Time System Permissions", fontWeight = FontWeight.Bold, fontSize = 16.sp)
 
-        OutlinedTextField(
-            value = instructions,
-            onValueChange = onInstructionsChange,
-            label = { Text("Custom Call Instructions") },
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(120.dp),
-            shape = RoundedCornerShape(12.dp)
-        )
-
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            AssistChip(
-                onClick = { onInstructionsChange("I am in a meeting. Ask who is calling and if it is urgent.") },
-                label = { Text("In a Meeting") }
-            )
-            AssistChip(
-                onClick = { onInstructionsChange("If this is a delivery call, tell them to leave the package at the door.") },
-                label = { Text("Delivery Mode") }
-            )
+        Button(
+            onClick = {
+                context.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+            },
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0F172A))
+        ) {
+            Icon(Icons.Default.Notifications, contentDescription = null)
+            Spacer(Modifier.width(8.dp))
+            Text("Enable Notification Reader Access")
         }
 
-        Text("Spoken Language:", fontWeight = FontWeight.SemiBold)
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            listOf("English", "Telugu", "Hindi").forEach { lang ->
-                FilterChip(
-                    selected = selectedLanguage == lang,
-                    onClick = { onLanguageChange(lang) },
-                    label = { Text(lang) }
-                )
-            }
+        Button(
+            onClick = {
+                context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+            },
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0F172A))
+        ) {
+            Icon(Icons.Default.AccessibilityNew, contentDescription = null)
+            Spacer(Modifier.width(8.dp))
+            Text("Enable Auto-Login & UI Accessibility")
         }
 
         HorizontalDivider(Modifier.padding(vertical = 4.dp))
-        Text("Gemini AI Configuration", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+        Text("2. Default Login Credentials (Optional)", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+        Text(
+            "Say 'Login with my credentials' or 'Login with username X and password Y' on any login screen.",
+            fontSize = 12.sp,
+            color = Color.Gray
+        )
+
+        OutlinedTextField(
+            value = savedUser,
+            onValueChange = onUserChange,
+            label = { Text("Default Username / Email") },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true
+        )
+
+        OutlinedTextField(
+            value = savedPass,
+            onValueChange = onPassChange,
+            label = { Text("Default Password") },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true
+        )
+
+        HorizontalDivider(Modifier.padding(vertical = 4.dp))
+        Text("3. Gemini AI Key & Model", fontWeight = FontWeight.Bold, fontSize = 16.sp)
 
         OutlinedTextField(
             value = apiKey,
             onValueChange = onApiKeyChange,
             label = { Text("Google AI Studio API Key") },
-            placeholder = { Text("AIzaSy...") },
             modifier = Modifier.fillMaxWidth(),
             singleLine = true
         )
@@ -542,216 +1202,9 @@ fun TellEqualScreen(
         OutlinedTextField(
             value = modelName,
             onValueChange = onModelNameChange,
-            label = { Text("Gemini Model Name") },
-            placeholder = { Text("gemini-2.5-flash") },
+            label = { Text("Model Name (e.g. gemini-2.5-flash)") },
             modifier = Modifier.fillMaxWidth(),
             singleLine = true
         )
-    }
-}
-
-@Composable
-fun LiveCallScreen(
-    apiKey: String,
-    modelName: String,
-    instructions: String,
-    language: String,
-    onSpeak: (String, String) -> Unit,
-    onStartListening: (String, (String) -> Unit) -> Unit,
-    onEndCall: (ScreenedCall?) -> Unit
-) {
-    val scope = rememberCoroutineScope()
-    val transcript = remember { mutableStateListOf<TranscriptTurn>() }
-    var callerInput by remember { mutableStateOf("") }
-    var isProcessing by remember { mutableStateOf(false) }
-    val callerNumber = "+91 90000 54321"
-
-    LaunchedEffect(Unit) {
-        val greeting = when (language) {
-            "Telugu" -> "నమస్కారం! నేను ఈక్వల్ AI అసిస్టెంట్ మాట్లాడుతున్నాను. ఎవరు మాట్లాడుతున్నారు మరియు ఎందుకు ఫోన్ చేశారో చెప్పగలరా?"
-            "Hindi" -> "नमस्ते! मैं इक्वल AI असिस्टेंट बात कर रहा हूँ। कृपया बताएं कौन बोल रहा है और किस काम से कॉल किया है?"
-            else -> "Hello! I am the Equal AI call assistant. Who is calling and how may I help you?"
-        }
-        transcript.add(TranscriptTurn("Equal AI", greeting))
-        onSpeak(greeting, language)
-    }
-
-    fun sendCallerMessage(text: String) {
-        if (text.isBlank()) return
-        transcript.add(TranscriptTurn("Caller", text))
-        callerInput = ""
-        isProcessing = true
-
-        scope.launch {
-            val historyText = transcript.joinToString("\n") { "${it.speaker}: ${it.text}" }
-            val prompt = """
-                You are Equal AI, a live phone receptionist screening a call on behalf of your user.
-                User instructions: $instructions
-                Reply in $language in 1-2 polite, natural spoken sentences.
-                
-                Call transcript so far:
-                $historyText
-                
-                Equal AI:
-            """.trimIndent()
-
-            val reply = withContext(Dispatchers.IO) {
-                try {
-                    callGeminiRestApi(apiKey, modelName, prompt).trim()
-                } catch (e: Exception) {
-                    "Connection error: ${e.localizedMessage}"
-                }
-            }
-            transcript.add(TranscriptTurn("Equal AI", reply))
-            onSpeak(reply, language)
-            isProcessing = false
-        }
-    }
-
-    fun finishAndSummarize() {
-        isProcessing = true
-        scope.launch {
-            val historyText = transcript.joinToString("\n") { "${it.speaker}: ${it.text}" }
-            val summaryPrompt = """
-                Summarize this phone call in 1-2 concise sentences (who called and why).
-                Then on a new line starting with ACTIONS:, list 2 short post-call actions separated by a comma.
-                
-                Transcript:
-                $historyText
-            """.trimIndent()
-
-            val res = withContext(Dispatchers.IO) {
-                try {
-                    callGeminiRestApi(apiKey, modelName, summaryPrompt)
-                } catch (e: Exception) {
-                    "Call screened by Equal AI."
-                }
-            }
-
-            val parts = res.split("ACTIONS:")
-            val summaryText = parts[0].trim()
-            val actions = if (parts.size > 1) {
-                parts[1].split(",").map { it.trim() }
-            } else {
-                listOf("Call back $callerNumber")
-            }
-
-            val time = SimpleDateFormat("hh:mm a", Locale.getDefault()).format(Date())
-            onEndCall(
-                ScreenedCall(
-                    callerName = "Screened Caller",
-                    phoneNumber = callerNumber,
-                    timestamp = "Today, $time",
-                    transcript = transcript.toList(),
-                    summary = summaryText,
-                    actionItems = actions,
-                    category = "AI Screened"
-                )
-            )
-        }
-    }
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color(0xFF0F172A))
-            .padding(16.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-        Spacer(Modifier.height(12.dp))
-        Text("Equal AI Screening Live Call", color = Color(0xFF10B981), fontWeight = FontWeight.Bold)
-        Text(callerNumber, color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold)
-        Text("Language: $language • Model: $modelName", color = Color.LightGray, fontSize = 12.sp)
-
-        Spacer(Modifier.height(12.dp))
-
-        LazyColumn(
-            modifier = Modifier
-                .weight(1f)
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(16.dp))
-                .background(Color(0xFF1E293B))
-                .padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            items(transcript) { turn ->
-                val isAi = turn.speaker == "Equal AI"
-                Column(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalAlignment = if (isAi) Alignment.Start else Alignment.End
-                ) {
-                    Text(
-                        turn.speaker,
-                        color = if (isAi) Color(0xFF10B981) else Color(0xFF38BDF8),
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Surface(
-                        color = if (isAi) Color(0xFF334155) else Color(0xFF0284C7),
-                        shape = RoundedCornerShape(12.dp)
-                    ) {
-                        Text(
-                            turn.text,
-                            color = Color.White,
-                            fontSize = 14.sp,
-                            modifier = Modifier.padding(10.dp)
-                        )
-                    }
-                }
-            }
-        }
-
-        if (isProcessing) {
-            LinearProgressIndicator(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp))
-        }
-
-        Spacer(Modifier.height(12.dp))
-
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            IconButton(
-                onClick = {
-                    onStartListening(language) { spoken ->
-                        sendCallerMessage(spoken)
-                    }
-                },
-                modifier = Modifier
-                    .clip(CircleShape)
-                    .background(Color(0xFF10B981))
-            ) {
-                Icon(Icons.Default.Mic, contentDescription = "Speak", tint = Color.White)
-            }
-
-            OutlinedTextField(
-                value = callerInput,
-                onValueChange = { callerInput = it },
-                placeholder = { Text("Caller says...", color = Color.LightGray) },
-                modifier = Modifier.weight(1f),
-                colors = OutlinedTextFieldDefaults.colors(
-                    focusedTextColor = Color.White,
-                    unfocusedTextColor = Color.White
-                ),
-                singleLine = true
-            )
-
-            IconButton(onClick = { sendCallerMessage(callerInput) }) {
-                Icon(Icons.Default.Send, contentDescription = "Send", tint = Color(0xFF10B981))
-            }
-        }
-
-        Spacer(Modifier.height(16.dp))
-
-        Button(
-            onClick = { finishAndSummarize() },
-            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFEF4444)),
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Icon(Icons.Default.CallEnd, contentDescription = null)
-            Spacer(Modifier.width(8.dp))
-            Text("End Call & Generate AI Summary")
-        }
     }
 }
