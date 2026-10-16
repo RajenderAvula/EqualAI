@@ -12,8 +12,7 @@
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
     <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_PHONE_CALL" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
@@ -33,11 +32,15 @@
             </intent-filter>
         </activity>
 
-        <!-- Persistent Background Assistant Service -->
+        <!-- Safe Background Foreground Service -->
         <service
             android:name=".EqualForegroundService"
-            android:foregroundServiceType="microphone|phoneCall"
-            android:exported="false" />
+            android:foregroundServiceType="specialUse"
+            android:exported="false">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Equal AI background voice and notification assistant" />
+        </service>
 
         <!-- Notification Listener Service -->
         <service
@@ -50,7 +53,7 @@
             </intent-filter>
         </service>
 
-        <!-- UI & Auto-Login Accessibility Service -->
+        <!-- Accessibility / Auto-Login Service -->
         <service
             android:name=".EqualAccessibilityService"
             android:label="Equal AI UI &amp; Login Assistant"
