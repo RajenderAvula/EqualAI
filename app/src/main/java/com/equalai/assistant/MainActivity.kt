@@ -5,6 +5,7 @@ import android.accessibilityservice.AccessibilityService
 import android.app.*
 import android.content.*
 import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.net.Uri
 import android.os.*
 import android.provider.ContactsContract
@@ -118,7 +119,7 @@ object AssistantBridge {
 }
 
 // ============================================================================
-// 2. PERSISTENT FOREGROUND SERVICE (Ensures Background Survival)
+// 2. CRASH-SAFE FOREGROUND SERVICE
 // ============================================================================
 
 class EqualForegroundService : Service(), TextToSpeech.OnInitListener {
@@ -129,9 +130,26 @@ class EqualForegroundService : Service(), TextToSpeech.OnInitListener {
     override fun onCreate() {
         super.onCreate()
         AssistantBridge.foregroundService = this
-        tts = TextToSpeech(this, this)
+        try {
+            tts = TextToSpeech(this, this)
+        } catch (e: Exception) {
+            AssistantBridge.log("Service TTS init error: ${e.localizedMessage}")
+        }
         createNotificationChannel()
-        startForeground(1001, buildNotification("Equal AI Active in Background"))
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(
+                    1001,
+                    buildNotification("Equal AI Active in Background"),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                )
+            } else {
+                startForeground(1001, buildNotification("Equal AI Active in Background"))
+            }
+        } catch (e: Exception) {
+            AssistantBridge.log("startForeground exception handled: ${e.localizedMessage}")
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -234,9 +252,7 @@ class EqualNotificationService : NotificationListenerService() {
 
             if (AssistantBridge.readNotificationsAloud) {
                 val promptText = "Notification from $appName. ${item.sender} says: ${item.message}. What would you like to do next?"
-                // Show in text box
                 AssistantBridge.promptInTextBoxCallback?.invoke("From $appName: ${item.message} -> What next?")
-                // Speak and ask
                 AssistantBridge.speakAndPromptCallback?.invoke(promptText, true)
                 AssistantBridge.foregroundService?.speakBackground(promptText)
             }
@@ -274,7 +290,7 @@ class EqualNotificationService : NotificationListenerService() {
 }
 
 // ============================================================================
-// 4. ACCESSIBILITY SERVICE (Auto-Login & Auto-Send)
+// 4. ACCESSIBILITY SERVICE
 // ============================================================================
 
 class EqualAccessibilityService : AccessibilityService() {
@@ -356,7 +372,7 @@ class EqualAccessibilityService : AccessibilityService() {
 }
 
 // ============================================================================
-// 5. CALL SCREENING, ANNOUNCING & AUTO-ANSWER RECEPTIONIST
+// 5. CALL SCREENING SERVICE
 // ============================================================================
 
 class EqualCallScreeningService : CallScreeningService() {
@@ -365,20 +381,17 @@ class EqualCallScreeningService : CallScreeningService() {
         val phoneNumber = callDetails.handle?.schemeSpecificPart ?: "Unknown Caller"
         val callerName = ActionExecutor.resolveCallerName(this, phoneNumber)
 
-        AssistantBridge.log("Incoming call from: $callerName ($phoneNumber)")
+        AssistantBridge.log("Incoming call: $callerName ($phoneNumber)")
 
-        // 1. Announce Aloud
         val announceSpeech = "You have an incoming call from $callerName."
         AssistantBridge.speakAndPromptCallback?.invoke(announceSpeech, false)
         AssistantBridge.foregroundService?.speakBackground(announceSpeech)
 
-        // 2. Schedule Auto-Answer if unanswered in 10 seconds
         val handler = Handler(Looper.getMainLooper())
         handler.postDelayed({
             autoAnswerAndRunAiReceptionist(this, phoneNumber, callerName)
         }, 10000)
 
-        // Do not reject immediately; allow user to hear ringing
         val response = CallResponse.Builder().build()
         respondToCall(callDetails, response)
     }
@@ -391,17 +404,15 @@ class EqualCallScreeningService : CallScreeningService() {
                     tm?.acceptRingingCall()
                     AssistantBridge.log("Auto-answered call from $name")
 
-                    // Play Receptionist Greeting
                     val greeting = "Hello, my owner is currently unavailable. This is Equal AI. Please leave your message after the tone."
                     AssistantBridge.speakAndPromptCallback?.invoke(greeting, false)
                     AssistantBridge.foregroundService?.speakBackground(greeting)
 
-                    // Post simulated transcript & summary to UI
                     val time = SimpleDateFormat("hh:mm a", Locale.getDefault()).format(Date())
                     val transcript = CallTranscriptItem(
                         caller = "$name ($number)",
-                        summary = "Unanswered call answered by Equal AI receptionist. Caller informed owner is unavailable.",
-                        fullTranscript = "Equal AI: $greeting\nCaller: [Voice call audio logged]",
+                        summary = "Unanswered call answered by Equal AI. Informed caller that owner is unavailable.",
+                        fullTranscript = "Equal AI: $greeting\nCaller: [Audio logged]",
                         timestamp = time
                     )
                     AssistantBridge.callLogs.add(0, transcript)
@@ -409,13 +420,13 @@ class EqualCallScreeningService : CallScreeningService() {
                 }
             }
         } catch (e: Exception) {
-            AssistantBridge.log("Auto-answer failed: ${e.localizedMessage}")
+            AssistantBridge.log("Auto-answer error: ${e.localizedMessage}")
         }
     }
 }
 
 // ============================================================================
-// 6. ACTION EXECUTOR & SCHEDULER
+// 6. ACTION EXECUTOR
 // ============================================================================
 
 object ActionExecutor {
@@ -625,7 +636,6 @@ suspend fun parseWithGemini(
 ) {
     val clean = spoken.trim().lowercase()
 
-    // Fast-path offline commands
     if (clean.startsWith("open ") || clean.startsWith("launch ")) {
         val app = clean.removePrefix("open ").removePrefix("launch ")
         ActionExecutor.openAppByName(context, app)
@@ -663,6 +673,8 @@ suspend fun parseWithGemini(
                 requestMethod = "POST"
                 setRequestProperty("Content-Type", "application/json")
                 doOutput = true
+                connectTimeout = 10000
+                readTimeout = 10000
             }
             val payload = JSONObject().apply {
                 put("contents", JSONArray().put(JSONObject().put("parts", JSONArray().put(JSONObject().put("text", prompt)))))
@@ -708,7 +720,7 @@ suspend fun parseWithGemini(
 }
 
 // ============================================================================
-// 8. MAIN ACTIVITY & COMPOSE UI
+// 8. MAIN ACTIVITY
 // ============================================================================
 
 class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
@@ -719,15 +731,31 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        tts = TextToSpeech(this, this)
-        speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
 
-        // Start Foreground Service to keep background alive
-        val serviceIntent = Intent(this, EqualForegroundService::class.java)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(serviceIntent)
-        } else {
-            startService(serviceIntent)
+        try {
+            tts = TextToSpeech(this, this)
+        } catch (e: Exception) {
+            AssistantBridge.log("TTS init exception: ${e.localizedMessage}")
+        }
+
+        try {
+            if (SpeechRecognizer.isRecognitionAvailable(this)) {
+                speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
+            }
+        } catch (e: Exception) {
+            AssistantBridge.log("SpeechRecognizer unavailable: ${e.localizedMessage}")
+        }
+
+        // Start Foreground Service safely
+        try {
+            val serviceIntent = Intent(this, EqualForegroundService::class.java)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(serviceIntent)
+            } else {
+                startService(serviceIntent)
+            }
+        } catch (e: Exception) {
+            AssistantBridge.log("Service start deferred: ${e.localizedMessage}")
         }
 
         setContent {
@@ -798,6 +826,15 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     }
 
     private fun startSttSession(isOffline: Boolean, onResult: (String) -> Unit) {
+        if (speechRecognizer == null) {
+            try {
+                speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
+            } catch (e: Exception) {
+                AssistantBridge.log("Cannot create recognizer: ${e.localizedMessage}")
+                return
+            }
+        }
+
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-IN")
@@ -829,6 +866,10 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     }
 }
 
+// ============================================================================
+// 9. COMPOSE UI
+// ============================================================================
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun EqualAssistantMainScreen(
@@ -842,7 +883,6 @@ fun EqualAssistantMainScreen(
     var universalInput by remember { mutableStateOf("") }
     var isOfflineStt by remember { mutableStateOf(false) }
 
-    // Voice Preview Dialog State
     var showPreviewDialog by remember { mutableStateOf(false) }
     var previewVoiceText by remember { mutableStateOf("") }
 
@@ -871,7 +911,6 @@ fun EqualAssistantMainScreen(
                     }
                 },
                 actions = {
-                    // STT Engine Toggle (Online / Offline)
                     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(end = 6.dp)) {
                         Text(if (isOfflineStt) "Offline" else "Online", fontSize = 11.sp, color = Color.Gray)
                         Switch(
@@ -914,7 +953,7 @@ fun EqualAssistantMainScreen(
                     selected = selectedTab == 2,
                     onClick = { selectedTab = 2 },
                     icon = { Icon(Icons.Default.PhoneCallback, contentDescription = null) },
-                    label = { Text("Calls & Summaries") }
+                    label = { Text("Calls") }
                 )
                 NavigationBarItem(
                     selected = selectedTab == 3,
@@ -932,7 +971,6 @@ fun EqualAssistantMainScreen(
                 .background(Color(0xFFF8FAFC))
                 .padding(16.dp)
         ) {
-            // Universal Interactive Text Box
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
@@ -982,7 +1020,6 @@ fun EqualAssistantMainScreen(
         }
     }
 
-    // Voice Preview Confirmation Dialog
     if (showPreviewDialog) {
         AlertDialog(
             onDismissRequest = { showPreviewDialog = false },
@@ -1020,7 +1057,7 @@ fun EqualAssistantMainScreen(
 }
 
 // ============================================================================
-// 9. TAB IMPLEMENTATIONS
+// 10. TAB SCREENS
 // ============================================================================
 
 @Composable
@@ -1084,7 +1121,6 @@ fun SchedulerTab(context: Context) {
     var selectedCalendar by remember { mutableStateOf(Calendar.getInstance()) }
     var attachmentUriString by remember { mutableStateOf<String?>(null) }
 
-    // Contact Picker Launcher
     val contactPicker = rememberLauncherForActivityResult(ActivityResultContracts.PickContact()) { uri ->
         uri?.let {
             val cursor = context.contentResolver.query(it, null, null, null, null)
@@ -1108,12 +1144,8 @@ fun SchedulerTab(context: Context) {
         }
     }
 
-    // Media Launchers
     val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         attachmentUriString = uri?.toString()
-    }
-    val videoRecorder = rememberLauncherForActivityResult(ActivityResultContracts.CaptureVideo()) { success ->
-        if (!success) attachmentUriString = null
     }
 
     Column(
@@ -1128,7 +1160,6 @@ fun SchedulerTab(context: Context) {
             }
         }
 
-        // Contact Box with Import Button
         Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             OutlinedTextField(
                 value = target,
@@ -1142,7 +1173,6 @@ fun SchedulerTab(context: Context) {
             }
         }
 
-        // Message Box with File / Audio / Video Attachments
         Column {
             OutlinedTextField(
                 value = message,
@@ -1176,7 +1206,6 @@ fun SchedulerTab(context: Context) {
             }
         }
 
-        // Date and Time Pickers
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(
                 onClick = {
@@ -1250,12 +1279,12 @@ fun SchedulerTab(context: Context) {
 fun CallsAndSummariesTab() {
     Column(modifier = Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Text("AI Receptionist Call Summaries", fontWeight = FontWeight.Bold, fontSize = 16.sp)
-        Text("When a call is unanswered, Equal AI answers, speaks the receptionist greeting, and records the transcript here:", fontSize = 12.sp, color = Color.Gray)
+        Text("Unanswered calls will be automatically received by Equal AI and logged here:", fontSize = 12.sp, color = Color.Gray)
 
         LazyColumn(modifier = Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             if (AssistantBridge.callLogs.isEmpty()) {
                 item {
-                    Text("No screened calls yet. Incoming unattended calls will automatically show transcripts here.", fontSize = 13.sp, color = Color.Gray)
+                    Text("No screened calls yet.", fontSize = 13.sp, color = Color.Gray)
                 }
             }
             items(AssistantBridge.callLogs) { call ->
