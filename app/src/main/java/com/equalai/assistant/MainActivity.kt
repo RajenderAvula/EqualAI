@@ -1241,47 +1241,68 @@ fun CallsAndSummariesTab() {
 
 @Composable
 fun SetupTab(
-    context: Context, apiKey: String, onApiKeyChange: (String) -> Unit,
-    modelName: String, onModelNameChange: (String) -> Unit,
-    savedUser: String, onUserChange: (String) -> Unit,
-    savedPass: String, onPassChange: (String) -> Unit
+    context: Context,
+    apiKey: String,
+    onApiKeyChange: (String) -> Unit,
+    modelName: String,
+    onModelNameChange: (String) -> Unit,
+    savedUser: String,
+    onUserChange: (String) -> Unit,
+    savedPass: String,
+    onPassChange: (String) -> Unit
 ) {
     val roleLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-        AssistantBridge.log("Role prompt completed")
+        AssistantBridge.log("Role assignment completed with result code: ${result.resultCode}")
     }
 
-    Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
         Text("1. Required System Permissions", fontWeight = FontWeight.Bold)
 
-        // Resilient Caller ID role button with automatic OEM fallback
+        // Resilient Caller ID & Call Answering Role Request
         Button(
             onClick = {
-                var launchedRoleDialog = false
+                var launched = false
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     val roleManager = context.getSystemService(Context.ROLE_SERVICE) as? RoleManager
-                    if (roleManager != null && roleManager.isRoleAvailable(RoleManager.ROLE_CALL_SCREENING)) {
-                        if (!roleManager.isRoleHeld(RoleManager.ROLE_CALL_SCREENING)) {
+                    if (roleManager != null) {
+                        // 1. Try Call Screening role
+                        if (roleManager.isRoleAvailable(RoleManager.ROLE_CALL_SCREENING)) {
                             try {
                                 roleLauncher.launch(roleManager.createRequestRoleIntent(RoleManager.ROLE_CALL_SCREENING))
-                                launchedRoleDialog = true
-                            } catch (e: Exception) {}
-                        } else {
-                            AssistantBridge.log("Caller ID role is already granted!")
-                            launchedRoleDialog = true
+                                launched = true
+                            } catch (e: Exception) {
+                                AssistantBridge.log("Call screening role intent failed: ${e.localizedMessage}")
+                            }
+                        }
+                        // 2. Fallback: Request Default Phone App role (Guaranteed on all OEMs)
+                        if (!launched && roleManager.isRoleAvailable(RoleManager.ROLE_DIALER)) {
+                            try {
+                                roleLauncher.launch(roleManager.createRequestRoleIntent(RoleManager.ROLE_DIALER))
+                                launched = true
+                                AssistantBridge.log("Requesting Default Phone App role for call handling...")
+                            } catch (e: Exception) {
+                                AssistantBridge.log("Dialer role intent failed: ${e.localizedMessage}")
+                            }
                         }
                     }
                 }
-                // Fallback for OEMs where direct role dialog is hidden
-                if (!launchedRoleDialog) {
+
+                // 3. Fallback: Open Default Apps screen directly
+                if (!launched) {
                     try {
-                        val fallbackIntent = Intent(Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS)
-                        context.startActivity(fallbackIntent)
-                        AssistantBridge.log("Opened Default Apps. Tap 'Caller ID & spam' and select Equal AI.")
+                        val defaultAppsIntent = Intent(Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS)
+                        context.startActivity(defaultAppsIntent)
+                        AssistantBridge.log("Opened Default Apps. Tap 'Caller ID & spam' or 'Phone app' and pick Equal AI.")
                     } catch (e: Exception) {
-                        val appDetailsIntent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                        val appDetails = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
                             data = Uri.parse("package:${context.packageName}")
                         }
-                        context.startActivity(appDetailsIntent)
+                        context.startActivity(appDetails)
                     }
                 }
             },
@@ -1290,24 +1311,67 @@ fun SetupTab(
         ) {
             Icon(Icons.Default.Shield, contentDescription = null, modifier = Modifier.size(18.dp))
             Spacer(Modifier.width(6.dp))
-            Text("Enable Caller ID & Spam Role (For Calls)")
+            Text("Enable Caller ID & Call Answering Role")
         }
 
-        Button(onClick = { context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0F172A))) {
+        Button(
+            onClick = { context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) },
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0F172A))
+        ) {
             Text("Enable Accessibility (Opens Apps from Background)")
         }
 
-        Button(onClick = { context.startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:${context.packageName}"))) }, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0F172A))) {
+        Button(
+            onClick = {
+                val intent = Intent(
+                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:${context.packageName}")
+                )
+                context.startActivity(intent)
+            },
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0F172A))
+        ) {
             Text("Enable Display Over Other Apps")
         }
 
-        Button(onClick = { context.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)) }, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0F172A))) {
+        Button(
+            onClick = { context.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)) },
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0F172A))
+        ) {
             Text("Enable Notification Listener")
         }
 
         HorizontalDivider(Modifier.padding(vertical = 4.dp))
         Text("2. Cloud AI Configuration", fontWeight = FontWeight.Bold)
-        OutlinedTextField(value = apiKey, onValueChange = onApiKeyChange, label = { Text("AI Studio API Key") }, modifier = Modifier.fillMaxWidth())
-        OutlinedTextField(value = modelName, onValueChange = onModelNameChange, label = { Text("Model Name") }, modifier = Modifier.fillMaxWidth())
+        OutlinedTextField(
+            value = apiKey,
+            onValueChange = onApiKeyChange,
+            label = { Text("AI Studio API Key") },
+            modifier = Modifier.fillMaxWidth()
+        )
+        OutlinedTextField(
+            value = modelName,
+            onValueChange = onModelNameChange,
+            label = { Text("Model Name (gemini-2.5-flash)") },
+            modifier = Modifier.fillMaxWidth()
+        )
+
+        HorizontalDivider(Modifier.padding(vertical = 4.dp))
+        Text("3. Auto-Login Credentials", fontWeight = FontWeight.Bold)
+        OutlinedTextField(
+            value = savedUser,
+            onValueChange = onUserChange,
+            label = { Text("Username / Email") },
+            modifier = Modifier.fillMaxWidth()
+        )
+        OutlinedTextField(
+            value = savedPass,
+            onValueChange = onPassChange,
+            label = { Text("Password") },
+            modifier = Modifier.fillMaxWidth()
+        )
     }
 }
